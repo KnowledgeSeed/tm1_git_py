@@ -3,13 +3,7 @@
     "Files": [],
     "Tasks": {
         "Proc_1": {
-            "Process": "Processes('myprocess')"
-        },
-        "Proc_2": {
-            "Process": "Processes('myprocess2')"
-        },
-        "Proc_3": {
-            "Process": "Processes('myprocess3')"
+            "Process": "Processes('my_migration')"
         }
     },
     "Ignore": [
@@ -20,11 +14,10 @@
     "Deployment": {
         "localhost": {
             "PrePull": [
-                "Tasks('Proc_1')",
-                "Tasks('Proc_2')"
+                "Tasks('Proc_1')"
             ],
             "PostPull": [
-                "Tasks('Proc_3')"
+                "Tasks('Proc_1')"
             ]
         }
     }
