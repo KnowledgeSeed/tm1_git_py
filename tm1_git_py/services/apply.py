@@ -690,16 +690,26 @@ def _get_deployment_hook_operations(
 
 def _apply_deployment_hook_operations(
     tm1_service: TM1Service,
-    project_file_path: Path | str,
     environment: str,
     operation: Literal["PrePull", "PostPull", "PrePush", "PostPush"],
+    project_file_path: Optional[Path | str] = None,
+    process_specs: Optional[list[dict[str, object]]] = None,
     **kwargs,
 ) -> Optional[Response]:
-    process_specs = _get_deployment_hook_operations(
-        project_file_path=project_file_path,
-        environment=environment,
-        operation=operation,
-    )
+
+    if project_file_path is not None:
+        process_specs = _get_deployment_hook_operations(
+            project_file_path=project_file_path,
+            environment=environment,
+            operation=operation,
+        )
+    elif process_specs is None:
+        raise ValueError(
+            "Pass either project_file_path for a valid tm1project.json file "
+            "or process_specs as a list[dict] with each item containing "
+            "'process_name' and optional 'parameters'."
+        )
+
     return _create_and_run_temp_process(
         tm1_service=tm1_service,
         process_specs=process_specs,

@@ -406,3 +406,53 @@ class TestApplyDeploymentHookHelpers:
             timeout=10,
         )
         assert result == "ok"
+
+    def test_apply_deployment_hook_operations_accepts_process_specs_directly(
+        self, mocker
+    ):
+        run_mock = mocker.patch(
+            "tm1_git_py.services.apply._create_and_run_temp_process",
+            return_value="ok",
+        )
+        tm1_service = mocker.Mock()
+        process_specs = [{"process_name": "ProcA", "parameters": []}]
+
+        result = _apply_deployment_hook_operations(
+            tm1_service=tm1_service,
+            environment="dev",
+            operation="PrePull",
+            process_specs=process_specs,
+            timeout=10,
+        )
+
+        run_mock.assert_called_once_with(
+            tm1_service=tm1_service,
+            process_specs=process_specs,
+            environment="dev",
+            operation="PrePull",
+            timeout=10,
+        )
+        assert result == "ok"
+
+    @pytest.mark.parametrize(
+        "kwargs,match",
+        [
+            (
+                {},
+                "Pass either project_file_path for a valid tm1project.json file or process_specs",
+            ),
+        ],
+    )
+    def test_apply_deployment_hook_operations_rejects_invalid_input(
+        self, mocker, kwargs, match
+    ):
+        mocker.patch("tm1_git_py.services.apply._create_and_run_temp_process")
+        tm1_service = mocker.Mock()
+
+        with pytest.raises(ValueError, match=match):
+            _apply_deployment_hook_operations(
+                tm1_service=tm1_service,
+                environment="dev",
+                operation="PrePull",
+                **kwargs,
+            )
