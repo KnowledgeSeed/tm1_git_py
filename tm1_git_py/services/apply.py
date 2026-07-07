@@ -673,6 +673,21 @@ def _create_and_run_temp_process(
         _cleanup_temp_process(tm1_service, unified_process_name, operation)
 
 
+def _get_deployment_hook_operations(
+    project_file_path: Path | str,
+    environment: str,
+    operation: Literal["PrePull", "PostPull", "PrePush", "PostPush"],
+) -> list[dict[str, object]]:
+    project_path, project_file = _load_tm1project_json(project_file_path)
+
+    return _resolve_operation_process_specs(
+        project_file=project_file,
+        environment=environment,
+        operation=operation,
+        project_path=project_path,
+    )
+
+
 def _apply_deployment_hook_operations(
     tm1_service: TM1Service,
     project_file_path: Path | str,
@@ -680,12 +695,10 @@ def _apply_deployment_hook_operations(
     operation: Literal["PrePull", "PostPull", "PrePush", "PostPush"],
     **kwargs,
 ) -> Optional[Response]:
-    project_path, project_file = _load_tm1project_json(project_file_path)
-    process_specs = _resolve_operation_process_specs(
-        project_file=project_file,
+    process_specs = _get_deployment_hook_operations(
+        project_file_path=project_file_path,
         environment=environment,
         operation=operation,
-        project_path=project_path,
     )
     return _create_and_run_temp_process(
         tm1_service=tm1_service,
@@ -707,4 +720,18 @@ apply_pre_push_operations = partial(
 )
 apply_post_push_operations = partial(
     _apply_deployment_hook_operations, operation="PostPush"
+)
+
+
+get_pre_pull_operations = partial(
+    _get_deployment_hook_operations, operation="PrePull"
+)
+get_post_pull_operations = partial(
+    _get_deployment_hook_operations, operation="PostPull"
+)
+get_pre_push_operations = partial(
+    _get_deployment_hook_operations, operation="PrePush"
+)
+get_post_push_operations = partial(
+    _get_deployment_hook_operations, operation="PostPush"
 )
