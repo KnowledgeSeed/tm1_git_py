@@ -254,7 +254,7 @@ class TestApplyDeploymentHookHelpers:
         }
 
         result = _resolve_operation_process_specs(
-            project_file=project_file,
+            project_json=project_file,
             environment="dev",
             operation=operation,
             project_path=tmp_path / "tm1project.json",
@@ -272,7 +272,7 @@ class TestApplyDeploymentHookHelpers:
             ValueError, match="Deployment must be a JSON object when present"
         ):
             _resolve_operation_process_specs(
-                project_file=project_file,
+                project_json=project_file,
                 environment="dev",
                 operation="PrePull",
                 project_path=tmp_path / "tm1project.json",
@@ -393,7 +393,7 @@ class TestApplyDeploymentHookHelpers:
 
         load_mock.assert_called_once_with("tm1project.json")
         resolve_mock.assert_called_once_with(
-            project_file={"Deployment": {}},
+            project_json={"Deployment": {}},
             environment="dev",
             operation=operation,
             project_path=Path("/tmp/tm1project.json"),
@@ -415,36 +415,53 @@ class TestApplyDeploymentHookHelpers:
             return_value="ok",
         )
         tm1_service = mocker.Mock()
-        process_specs = [{"process_name": "ProcA", "parameters": []}]
+        process_json = {
+            "Deployment": {"dev": {"PrePull": ["Tasks('TaskA')"]}},
+            "Tasks": {"TaskA": {"Process": "Processes('ProcA')"}},
+        }
 
         result = _apply_deployment_hook_operations(
             tm1_service=tm1_service,
             environment="dev",
             operation="PrePull",
-            process_specs=process_specs,
+            project_json=process_json,
             timeout=10,
         )
 
         run_mock.assert_called_once_with(
             tm1_service=tm1_service,
-            process_specs=process_specs,
+            process_specs=[{"process_name": "ProcA", "parameters": []}],
             environment="dev",
             operation="PrePull",
             timeout=10,
         )
         assert result == "ok"
 
+    def test_get_deployment_hook_operations_from_json_validates_and_resolves(
+        self,
+    ):
+        project_json = {
+            "Deployment": {"dev": {"PrePull": ["Tasks('TaskA')"]}},
+            "Tasks": {"TaskA": {"Process": "Processes('ProcA')"}},
+        }
+
+        result = _resolve_operation_process_specs(
+            project_json=project_json,
+            environment="dev",
+            operation="PrePull",
+        )
+
+        assert result == [{"process_name": "ProcA", "parameters": []}]
+
     @pytest.mark.parametrize(
-        "kwargs,match",
+        "process_json,match",
         [
-            (
-                {},
-                "Pass either project_file_path for a valid tm1project.json file or process_specs",
-            ),
+            (None, "Pass either project_file_path for a valid tm1project.json file"),
+            ([], "tm1project JSON body must be a JSON object"),
         ],
     )
     def test_apply_deployment_hook_operations_rejects_invalid_input(
-        self, mocker, kwargs, match
+        self, mocker, process_json, match
     ):
         mocker.patch("tm1_git_py.services.apply._create_and_run_temp_process")
         tm1_service = mocker.Mock()
@@ -454,5 +471,5 @@ class TestApplyDeploymentHookHelpers:
                 tm1_service=tm1_service,
                 environment="dev",
                 operation="PrePull",
-                **kwargs,
+                project_json=process_json,
             )

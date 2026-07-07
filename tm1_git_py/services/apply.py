@@ -590,12 +590,12 @@ def _load_tm1project_json(project_file_path: Path | str) -> tuple[Path, dict]:
 
 
 def _resolve_operation_process_specs(
-    project_file: dict,
+    project_json: dict,
     environment: str,
     operation: Literal["PrePull", "PostPull", "PrePush", "PostPush"],
-    project_path: Path,
+    project_path: Optional[Path] = None,
 ) -> list[dict[str, object]]:
-    deployment = project_file.get("Deployment") or {}
+    deployment = project_json.get("Deployment") or {}
     if not isinstance(deployment, dict):
         raise ValueError("Deployment must be a JSON object when present")
 
@@ -608,14 +608,14 @@ def _resolve_operation_process_specs(
     task_refs = environment_config.get(operation) or []
     if not task_refs:
         logger.info(
-            "No %s tasks for environment=%s project=%s",
+            "No %s tasks for environment=%s project=%s.",
             operation,
             environment,
             project_path,
         )
         return []
 
-    tasks = project_file.get("Tasks") or {}
+    tasks = project_json.get("Tasks") or {}
     if not isinstance(tasks, dict):
         raise ValueError("Tasks must be a JSON object when present")
 
@@ -626,7 +626,7 @@ def _resolve_operation_process_specs(
     )
     if not process_specs:
         logger.info(
-            "No executable %s tasks for environment=%s project=%s",
+            "No executable %s tasks for environment=%s project=%s.",
             operation,
             environment,
             project_path,
@@ -678,10 +678,10 @@ def _get_deployment_hook_operations(
     environment: str,
     operation: Literal["PrePull", "PostPull", "PrePush", "PostPush"],
 ) -> list[dict[str, object]]:
-    project_path, project_file = _load_tm1project_json(project_file_path)
+    project_path, project_json = _load_tm1project_json(project_file_path)
 
     return _resolve_operation_process_specs(
-        project_file=project_file,
+        project_json=project_json,
         environment=environment,
         operation=operation,
         project_path=project_path,
@@ -693,9 +693,19 @@ def _apply_deployment_hook_operations(
     environment: str,
     operation: Literal["PrePull", "PostPull", "PrePush", "PostPush"],
     project_file_path: Optional[Path | str] = None,
-    process_specs: Optional[list[dict[str, object]]] = None,
-    **kwargs,
+    project_json: Optional[dict] = None,
+    **kwargs
 ) -> Optional[Response]:
+    if project_json is None and project_file_path is None:
+        raise ValueError(
+            "Pass either project_file_path for a valid tm1project.json file "
+            "or the JSON body in process_specs."
+        )
+    if project_json and project_file_path:
+        raise ValueError(
+            "Pass either project_file_path for a valid tm1project.json file "
+            "or the JSON body in process_specs, but NOT both."
+        )
 
     if project_file_path is not None:
         process_specs = _get_deployment_hook_operations(
@@ -703,11 +713,14 @@ def _apply_deployment_hook_operations(
             environment=environment,
             operation=operation,
         )
-    elif process_specs is None:
-        raise ValueError(
-            "Pass either project_file_path for a valid tm1project.json file "
-            "or process_specs as a list[dict] with each item containing "
-            "'process_name' and optional 'parameters'."
+    else:
+        if not isinstance(project_json, dict):
+            raise ValueError("tm1project JSON body must be a JSON object")
+
+        process_specs = _resolve_operation_process_specs(
+            project_json=project_json,
+            environment=environment,
+            operation=operation
         )
 
     return _create_and_run_temp_process(
@@ -715,7 +728,7 @@ def _apply_deployment_hook_operations(
         process_specs=process_specs,
         environment=environment,
         operation=operation,
-        **kwargs,
+        **kwargs
     )
 
 
