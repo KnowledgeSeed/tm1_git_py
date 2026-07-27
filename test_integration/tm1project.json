@@ -1,0 +1,24 @@
+{
+    "Version": "1.0",
+    "Files": [],
+    "Tasks": {
+        "Proc_1": {
+            "Process": "Processes('my_migration')"
+        }
+    },
+    "Ignore": [
+        "!Cubes('}*')",
+        "!Processes('}*')",
+        "!Dimensions('}*')"
+    ],
+    "Deployment": {
+        "localhost": {
+            "PrePull": [
+                "Tasks('Proc_1')"
+            ],
+            "PostPull": [
+                "Tasks('Proc_1')"
+            ]
+        }
+    }
+}

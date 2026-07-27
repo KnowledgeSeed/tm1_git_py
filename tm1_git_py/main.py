@@ -33,6 +33,12 @@ from tm1_git_py.reporting.progress_reporting import (
     TqdmProgressSink,
 )
 from tm1_git_py.services.changeset import import_changeset
+from tm1_git_py.services.apply import (
+    apply_post_pull_operations,
+    apply_post_push_operations,
+    apply_pre_pull_operations,
+    apply_pre_push_operations,
+)
 from tm1_git_py.services.comparator import Comparator, TqdmComparatorProgressSink
 from tm1_git_py.services.deserializer import deserialize_model
 from tm1_git_py.services.exporter import export
@@ -456,6 +462,58 @@ def _cmd_changeset_filter(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_run_hook(args: argparse.Namespace) -> None:
+    project_path = _filter_path_from_arg(args.tm1project)
+    if not project_path.is_file():
+        logger.error("tm1project file not found: %s", project_path)
+        sys.exit(1)
+
+    if args.deployment:
+        phase = args.deployment
+        operation = "deployment"
+        task_runner = {
+            "pre": apply_pre_pull_operations,
+            "post": apply_post_pull_operations,
+        }[phase]
+    elif args.source_control:
+        phase = args.source_control
+        operation = "source-control"
+        task_runner = {
+            "pre": apply_pre_push_operations,
+            "post": apply_post_push_operations,
+        }[phase]
+    else:
+        # argparse requires exactly one phase option. Keep this guard for callers
+        # that invoke the handler directly.
+        raise ValueError("Select a deployment or source-control phase")
+
+    logger.info(
+        "Running %s project tasks for %s phase in environment '%s'",
+        operation,
+        phase,
+        args.environment,
+    )
+    response = task_runner(
+        tm1_service=_tm1_connection(args.server),
+        environment=args.environment,
+        project_file_path=project_path,
+    )
+    if response is None:
+        logger.info(
+            "No %s project tasks configured for %s phase in environment '%s'",
+            operation,
+            phase,
+            args.environment,
+        )
+    else:
+        logger.info(
+            "%s project tasks completed for %s phase in environment '%s'",
+            operation.capitalize(),
+            phase,
+            args.environment,
+        )
+
+
 def main():
     # Must run before argparse in frozen binaries so multiprocessing helper
     # processes (e.g. resource_tracker) do not get parsed as CLI commands.
@@ -590,6 +648,37 @@ def main():
         help="Filter rules as file path, file:// URI, or comma-separated rules",
     )
     p_changeset_filter.set_defaults(handler=_cmd_changeset_filter)
+
+    p_run_hook = sub.add_parser(
+        "run-hook",
+        help="Run configured pre/post deployment or source-control tasks",
+    )
+    _add_common_cli_options(p_run_hook)
+    p_run_hook.add_argument("-s", "--server", type=str, required=True, help="TM1 server name from tm1servers config")
+    p_run_hook.add_argument(
+        "--tm1project",
+        type=str,
+        required=True,
+        help="Path or file:// URI to tm1project.json",
+    )
+    p_run_hook.add_argument(
+        "--environment",
+        type=str,
+        required=True,
+        help="Deployment environment name in tm1project.json",
+    )
+    task_phase_group = p_run_hook.add_mutually_exclusive_group(required=True)
+    task_phase_group.add_argument(
+        "--deployment",
+        choices=["pre", "post"],
+        help="Run tasks before or after deployment",
+    )
+    task_phase_group.add_argument(
+        "--source-control",
+        choices=["pre", "post"],
+        help="Run tasks before or after source-control model tracking",
+    )
+    p_run_hook.set_defaults(handler=_cmd_run_hook)
 
     args = parser.parse_args()
     setup_logging(
