@@ -50,7 +50,7 @@ class ChangesetStore:
         root = (
             Path(base_dir).expanduser().resolve()
             if base_dir
-            else (Path.cwd().resolve() / ".tm1gitpy" / ".cache")
+            else (Path.home().resolve() / ".tm1gitpy" / ".cache")
         )
         return root / f"changeset-{changeset_id}.sqlite"
 

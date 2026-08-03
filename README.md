@@ -155,6 +155,35 @@ servers:
     password: ${TM1_PROD_PASSWORD}  # Environment variable placeholder
 ```
 
+### Changeset cache location
+
+Changesets are staged in SQLite while they are compared, imported, filtered,
+or applied. By default, tm1gitpy stores these disposable cache files in the
+user-scoped directory:
+
+```text
+~/.tm1gitpy/.cache/changeset-<changeset_id>.sqlite
+```
+
+The CLI uses this default automatically. Library consumers that need a
+project-local cache must pass `base_dir`; it is the complete cache directory,
+not the project root:
+
+```python
+from pathlib import Path
+from tm1_git_py import Changeset
+
+cache_dir = Path.cwd().resolve() / ".tm1gitpy" / ".cache"
+changeset = Changeset(changeset_id="202608030001", base_dir=str(cache_dir))
+
+# Use the same directory whenever the changeset is loaded again.
+loaded = Changeset.from_changeset_id("202608030001", base_dir=str(cache_dir))
+```
+
+Existing local SQLite cache files are not
+migrated automatically; they are temporary files and can be removed when they
+are no longer needed.
+
 ## Usage
 
 ### Export TM1 Model
