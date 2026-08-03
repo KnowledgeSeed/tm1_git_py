@@ -1,9 +1,16 @@
 from unittest import mock
+from pathlib import Path
 
 import pytest
 
 # Autouse: close ModelStore / ChangesetStore workers and remove sqlite files after each test.
 pytest_plugins = ("test_integration.sqlite_teardown",)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_home(monkeypatch, tmp_path):
+    """Keep default user-scoped caches inside each test's temporary directory."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
 
 
 class _PatchProxy:

@@ -1,9 +1,13 @@
+import argparse
 import json
 import sys
 
 import pytest
 
-from tm1_git_py.main import _load_filter_rules, _resolve_filter_rules
+import tm1_git_py.main as main_module
+from tm1_git_py.db.changeset_store import ChangesetStore
+from tm1_git_py.main import _cmd_changeset_filter, _load_filter_rules, _resolve_filter_rules
+from tm1_git_py.reporting.progress_reporting import NoopProgressSink
 from tm1_git_py.services.filter import FilterRules, apply_default_filter_rules
 
 
@@ -48,3 +52,25 @@ def test_resolve_filter_rules_missing_file_exits(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "exit", lambda code=1: (_ for _ in ()).throw(SystemExit(code)))
     with pytest.raises(SystemExit):
         _resolve_filter_rules(f"file://{path}")
+
+
+def test_changeset_filter_cli_uses_home_cache_by_default(tmp_path, monkeypatch):
+    working_dir = tmp_path / "working-dir"
+    working_dir.mkdir()
+    monkeypatch.chdir(working_dir)
+    monkeypatch.setattr(main_module, "TqdmProgressSink", lambda **_kwargs: NoopProgressSink())
+    changeset_path = tmp_path / "changeset.yaml"
+    changeset_path.write_text("changeset_id: cli-home-cache\nchanges:\n", encoding="utf-8")
+
+    _cmd_changeset_filter(
+        argparse.Namespace(
+            changeset_path=str(changeset_path),
+            filter_rules=None,
+            debug=False,
+        )
+    )
+
+    cache_path = ChangesetStore.path_for(changeset_id="cli-home-cache")
+    assert cache_path.exists()
+    assert cache_path.parent == (tmp_path / "home" / ".tm1gitpy" / ".cache").resolve()
+    assert not (working_dir / ".tm1gitpy").exists()

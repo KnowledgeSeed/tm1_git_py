@@ -7,6 +7,60 @@ from tests.unit_common import *
 
 
 class TestChangeset:
+    def test_changeset_store_default_path_uses_user_home_cache(self, monkeypatch, tmp_path):
+        home_dir = tmp_path / "home"
+        working_dir = tmp_path / "working-dir"
+        working_dir.mkdir()
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home_dir))
+        monkeypatch.chdir(working_dir)
+
+        path = ChangesetStore.path_for(changeset_id="home-cache")
+
+        assert path == home_dir.resolve() / ".tm1gitpy" / ".cache" / "changeset-home-cache.sqlite"
+
+    def test_changeset_store_explicit_base_dir_is_cache_directory(self, tmp_path):
+        cache_dir = tmp_path / "seeder-project" / ".tm1gitpy" / ".cache"
+
+        path = ChangesetStore.path_for(
+            changeset_id="explicit-cache",
+            base_dir=str(cache_dir),
+        )
+
+        assert path == cache_dir.resolve() / "changeset-explicit-cache.sqlite"
+
+    def test_changeset_store_expands_explicit_tilde_base_dir(self):
+        base_dir = "~/tm1gitpy-test-cache"
+
+        path = ChangesetStore.path_for(
+            changeset_id="expanded-home-cache",
+            base_dir=base_dir,
+        )
+
+        assert path == Path(base_dir).expanduser().resolve() / "changeset-expanded-home-cache.sqlite"
+
+    def test_changeset_reopens_from_explicit_seeder_cache_directory(self, tmp_path):
+        cache_dir = tmp_path / "seeder-project" / ".tm1gitpy" / ".cache"
+        changeset = Changeset(changeset_id="seeder-local-cache", base_dir=str(cache_dir))
+        process_obj = make_process(name="SeederLocalCache")
+        changeset.changes.append(
+            Change(
+                change_type=ChangeType.ADD,
+                object_type=ObjectType.PROCESS,
+                uri=process_obj.uri(),
+                body=process_obj,
+            )
+        )
+        changeset.close()
+
+        loaded = Changeset.from_changeset_id(
+            "seeder-local-cache",
+            base_dir=str(cache_dir),
+        )
+
+        assert loaded.sqlite_path.parent == cache_dir.resolve()
+        assert len(loaded.changes) == 1
+        assert loaded.changes[0].body.name == "SeederLocalCache"
+
     def test_sqlite_worker_await_query_result_times_out(self):
         w = object.__new__(SqliteWorker)
         w._file_name = "dummy.sqlite"
