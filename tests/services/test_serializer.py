@@ -51,9 +51,267 @@ class TestSerializer:
 
     def test_serializer_round_trip_sanity_check(self, tmp_path):
         model = build_mock_model()
-        serialize_model(model, str(tmp_path), max_workers=1)
+        assert serialize_model(model, str(tmp_path), max_workers=1) == []
         model_deserialized, errors = deserialize_model(str(tmp_path))
         assert model.to_dict() == model_deserialized.to_dict()
+
+    def test_serialize_model_collects_serial_hierarchy_failure_and_keeps_siblings(self, tmp_path, monkeypatch):
+        import tm1_git_py.services.serializer as serializer_module
+
+        successful_hierarchy = Hierarchy(
+            name="Working",
+            dimension_name="D",
+            elements=[Element(name="E1", type="Numeric")],
+            edges=[],
+            subsets=[],
+        )
+        failed_hierarchy = Hierarchy(
+            name="Broken",
+            dimension_name="D",
+            elements=[Element(name="E2", type="Numeric")],
+            edges=[],
+            subsets=[],
+        )
+        model = Model(
+            cubes=[],
+            dimensions=[
+                Dimension(
+                    name="D",
+                    hierarchies=[successful_hierarchy, failed_hierarchy],
+                    defaultHierarchy=successful_hierarchy,
+                )
+            ],
+            processes=[],
+            chores=[],
+        )
+        original_serialize_hierarchy_job = serializer_module._serialize_hierarchy_job
+
+        def fail_one_hierarchy(job, progress_sink):
+            if job["name"] == "Broken":
+                raise OSError("hierarchy output is unavailable")
+            return original_serialize_hierarchy_job(job, progress_sink)
+
+        monkeypatch.setattr(
+            serializer_module,
+            "_serialize_hierarchy_job",
+            fail_one_hierarchy,
+        )
+        callback_errors = []
+
+        errors = serialize_model(
+            model,
+            str(tmp_path),
+            max_workers=1,
+            error_callback=callback_errors.append,
+        )
+
+        assert len(errors) == 1
+        assert errors == callback_errors
+        assert errors[0].workflow == "serialize"
+        assert errors[0].phase == "hierarchy"
+        assert errors[0].severity == "recoverable"
+        assert errors[0].subject == str(tmp_path / "dimensions" / "D.hierarchies" / "Broken.json")
+        assert (tmp_path / "dimensions" / "D.json").is_file()
+        assert (tmp_path / "dimensions" / "D.hierarchies" / "Working.json").is_file()
+        assert not (tmp_path / "dimensions" / "D.hierarchies" / "Broken.json").exists()
+
+    def test_serialize_model_continues_independent_phases_after_failure(self, tmp_path, monkeypatch):
+        import tm1_git_py.services.serializer as serializer_module
+
+        model = Model(
+            cubes=[Cube(name="C", dimensions=[], rules=[], views=[])],
+            dimensions=[Dimension(name="D", hierarchies=[], defaultHierarchy=None)],
+            processes=[],
+            chores=[],
+        )
+        phases = []
+
+        def fail_dimensions(*_args, **_kwargs):
+            phases.append("dimensions")
+            raise RuntimeError("dimension phase failed")
+
+        def serialize_cubes_after_dimension_failure(*_args, **_kwargs):
+            phases.append("cubes")
+
+        monkeypatch.setattr(serializer_module, "serialize_dimensions", fail_dimensions)
+        monkeypatch.setattr(serializer_module, "serialize_cubes", serialize_cubes_after_dimension_failure)
+
+        errors = serialize_model(model, str(tmp_path), max_workers=1)
+
+        assert phases == ["dimensions", "cubes"]
+        assert [(error.phase, error.severity) for error in errors] == [
+            ("dimensions", "fatal"),
+        ]
+
+    def test_serialize_dimensions_collects_process_pool_failures_in_submission_order(self, tmp_path, monkeypatch):
+        from concurrent.futures import Future
+        import tm1_git_py.services.serializer as serializer_module
+
+        class EagerProcessPool:
+            def submit(self, fn, *args):
+                future = Future()
+                try:
+                    future.set_result(fn(*args))
+                except Exception as exc:
+                    future.set_exception(exc)
+                return future
+
+        first_hierarchy = Hierarchy(
+            name="FirstBroken",
+            dimension_name="D",
+            elements=[],
+            edges=[],
+            subsets=[],
+        )
+        working_hierarchy = Hierarchy(
+            name="Working",
+            dimension_name="D",
+            elements=[],
+            edges=[],
+            subsets=[],
+        )
+        last_hierarchy = Hierarchy(
+            name="LastBroken",
+            dimension_name="D",
+            elements=[],
+            edges=[],
+            subsets=[],
+        )
+        dimension = Dimension(
+            name="D",
+            hierarchies=[first_hierarchy, working_hierarchy, last_hierarchy],
+            defaultHierarchy=working_hierarchy,
+        )
+        original_serialize_hierarchy_job = serializer_module._serialize_hierarchy_job
+
+        def fail_selected_hierarchies(job, progress_sink):
+            if job["name"] in {"FirstBroken", "LastBroken"}:
+                raise OSError(f"cannot write {job['name']}")
+            return original_serialize_hierarchy_job(job, progress_sink)
+
+        monkeypatch.setattr(
+            serializer_module,
+            "_serialize_hierarchy_job",
+            fail_selected_hierarchies,
+        )
+        dim_dir = tmp_path / "dimensions"
+        dim_dir.mkdir()
+
+        errors = serializer_module.serialize_dimensions(
+            [dimension],
+            str(dim_dir),
+            process_pool=EagerProcessPool(),
+            progress_sink=serializer_module.NoopProgressSink(),
+        )
+
+        assert [error.subject for error in errors] == [
+            str(dim_dir / "D.hierarchies" / "FirstBroken.json"),
+            str(dim_dir / "D.hierarchies" / "LastBroken.json"),
+        ]
+        assert all(error.severity == "recoverable" for error in errors)
+        assert (dim_dir / "D.json").is_file()
+        assert (dim_dir / "D.hierarchies" / "Working.json").is_file()
+
+    def test_serialize_cubes_collects_io_failures_and_keeps_siblings(self, tmp_path, monkeypatch):
+        import tm1_git_py.services.serializer as serializer_module
+
+        cubes_dir = tmp_path / "cubes"
+        cubes_dir.mkdir()
+        working_cube = Cube(name="Working", dimensions=[], rules=[], views=[])
+        broken_cube = Cube(name="Broken", dimensions=[], rules=[], views=[])
+        original_serialize_cube = serializer_module._serialize_cube
+
+        def fail_one_cube(cube_job, output_dir, progress_sink):
+            if cube_job["name"] == "Broken":
+                raise OSError("cube output is unavailable")
+            return original_serialize_cube(cube_job, output_dir, progress_sink)
+
+        monkeypatch.setattr(serializer_module, "_serialize_cube", fail_one_cube)
+
+        errors = serializer_module.serialize_cubes(
+            [working_cube, broken_cube],
+            str(cubes_dir),
+            process_pool=None,
+            progress_sink=serializer_module.NoopProgressSink(),
+        )
+
+        assert [(error.phase, error.subject, error.severity) for error in errors] == [
+            ("cube", str(cubes_dir / "Broken.json"), "recoverable"),
+        ]
+        assert (cubes_dir / "Working.json").is_file()
+        assert not (cubes_dir / "Broken.json").exists()
+
+    def test_serialize_cubes_collects_process_pool_io_failures_in_submission_order(self, tmp_path, monkeypatch):
+        from concurrent.futures import Future
+        import tm1_git_py.services.serializer as serializer_module
+
+        class EagerProcessPool:
+            def submit(self, fn, *args):
+                future = Future()
+                try:
+                    future.set_result(fn(*args))
+                except Exception as exc:
+                    future.set_exception(exc)
+                return future
+
+        cubes_dir = tmp_path / "cubes"
+        cubes_dir.mkdir()
+        first_broken_cube = Cube(name="FirstBroken", dimensions=[], rules=[], views=[])
+        working_cube = Cube(name="Working", dimensions=[], rules=[], views=[])
+        last_broken_cube = Cube(name="LastBroken", dimensions=[], rules=[], views=[])
+        original_serialize_cube = serializer_module._serialize_cube
+
+        def fail_selected_cubes(cube_job, output_dir, progress_sink):
+            if cube_job["name"] in {"FirstBroken", "LastBroken"}:
+                raise OSError(f"cannot write {cube_job['name']}")
+            return original_serialize_cube(cube_job, output_dir, progress_sink)
+
+        monkeypatch.setattr(serializer_module, "_serialize_cube", fail_selected_cubes)
+
+        errors = serializer_module.serialize_cubes(
+            [first_broken_cube, working_cube, last_broken_cube],
+            str(cubes_dir),
+            process_pool=EagerProcessPool(),
+            progress_sink=serializer_module.NoopProgressSink(),
+        )
+
+        assert [error.subject for error in errors] == [
+            str(cubes_dir / "FirstBroken.json"),
+            str(cubes_dir / "LastBroken.json"),
+        ]
+        assert all(error.severity == "recoverable" for error in errors)
+        assert (cubes_dir / "Working.json").is_file()
+
+    def test_serialize_model_logs_diagnostics_once_and_at_info_summary(self, tmp_path, monkeypatch, caplog):
+        import logging
+        import tm1_git_py.services.serializer as serializer_module
+
+        model = Model(
+            cubes=[Cube(name="Broken", dimensions=[], rules=[], views=[])],
+            dimensions=[],
+            processes=[],
+            chores=[],
+        )
+
+        def fail_cube(*_args, **_kwargs):
+            raise OSError("cube output is unavailable")
+
+        monkeypatch.setattr(serializer_module, "_serialize_cube", fail_cube)
+        with caplog.at_level(logging.INFO, logger="tm1_git_py.services.serializer"):
+            errors = serialize_model(model, str(tmp_path), max_workers=1)
+
+        assert len(errors) == 1
+        diagnostic_records = [
+            record for record in caplog.records
+            if "Serialization diagnostic" in record.getMessage()
+        ]
+        assert len(diagnostic_records) == 1
+        assert diagnostic_records[0].levelno == logging.WARNING
+        assert any(
+            record.levelno == logging.INFO
+            and "Model serialization finished" in record.getMessage()
+            for record in caplog.records
+        )
 
     def test_serialize_dimensions_updates_store_backed_source_json_mtime(self, tmp_path):
         import uuid

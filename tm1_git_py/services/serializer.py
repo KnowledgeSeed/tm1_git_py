@@ -6,6 +6,8 @@ import shutil
 import sqlite3
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional
 from urllib.parse import quote
@@ -27,6 +29,12 @@ from tm1_git_py.model.hierarchy import (
 )
 from tm1_git_py.model.model import Model
 from tm1_git_py.model.process import Process
+from tm1_git_py.reporting.error_reporting import (
+    ErrorCallback,
+    WorkflowError,
+    collect_worker_errors,
+    workflow_error_from_exception,
+)
 from tm1_git_py.reporting.progress_reporting import MultiProcessProgressManager, NoopProgressSink, ProgressEvent, \
     ProgressSink
 
@@ -37,6 +45,32 @@ logger = logging.getLogger(__name__)
 SERIALIZER_POOL_GRACEFUL_SHUTDOWN_SEC = 45.0
 
 _PROCESS_POOL_UNAVAILABLE = object()
+
+
+@dataclass(frozen=True)
+class SerializationJobMetadata:
+    """Coordinator-side context for a serializable model artifact.
+
+    The metadata contains primitives only and remains beside a submitted job or
+    future.  In particular, it deliberately does not contain a callback or a
+    model object, so it can also be used when the job runs in a process pool.
+    """
+
+    phase: str
+    object_type: str
+    object_name: str
+    target_path: str
+    dimension_name: Optional[str] = None
+    hierarchy_name: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _SubmittedSerializationJob:
+    """Coordinator-only metadata kept beside a submitted future."""
+
+    submission_index: int
+    metadata: SerializationJobMetadata
+    dimension_id: Optional[int] = None
 
 
 _STORE_OBJECT_CONFIG = {
@@ -82,7 +116,14 @@ def serialize_model(
     *,
     progress_sink: Optional[ProgressSink] = None,
     max_workers: Optional[int] = None,
-):
+    error_callback: Optional[ErrorCallback] = None,
+) -> list[WorkflowError]:
+    """Serialize a model and return coordinator-collected diagnostics.
+
+    Serialization workers receive only their existing pickle-safe job data and
+    progress sink.  Error callbacks are invoked only after the coordinator has
+    collected all phase results and released process/progress resources.
+    """
     logger.info(
         "Serializing model to '%s' (dimensions=%d cubes=%d processes=%d chores=%d)",
         dir,
@@ -91,157 +132,469 @@ def serialize_model(
         len(model.processes),
         len(model.chores),
     )
-    os.makedirs(dir, exist_ok=True)
-
-    dir = _handle_long_path(dir)
-
-    cpu_workers = max_workers
-    if not cpu_workers:
-        cpu_workers = resolve_worker_counts(max_workers).cpu_workers
-
     progress_sink = progress_sink if progress_sink is not None else NoopProgressSink()
     multi_process_progress_manager: Optional[MultiProcessProgressManager] = None
-    if cpu_workers > 1 and not isinstance(progress_sink, NoopProgressSink):
-        multi_process_progress_manager = MultiProcessProgressManager(progress_sink)
-        multi_process_progress_manager.start()
-        active_progress_sink = multi_process_progress_manager.get_multi_process_progress_queue_sink()
-    else:
-        active_progress_sink = progress_sink
-
-    active_progress_sink.on_event(ProgressEvent.total_line(message="Serializing"))  
-    total_count = Model.recalculate_total_object_count(model)
-    active_progress_sink.on_event(ProgressEvent.total_line(total=total_count))
     process_pool = None
-    if cpu_workers > 1:
-        try:
-            multiprocessing.freeze_support()
-            process_pool = ProcessPoolExecutor(
-                **process_pool_executor_kwargs(
-                    max_workers=int(cpu_workers),
-                    initializer=ignore_sigint_in_worker,
-                ),
+    progress_manager_started = False
+    active_progress_sink: ProgressSink = progress_sink
+    setup_errors: list[WorkflowError] = []
+    dimension_errors: list[WorkflowError] = []
+    cube_errors: list[WorkflowError] = []
+    process_errors: list[WorkflowError] = []
+    chore_errors: list[WorkflowError] = []
+    cleanup_errors: list[WorkflowError] = []
+    can_serialize = True
+    cpu_workers = 1
+
+    try:
+        os.makedirs(dir, exist_ok=True)
+        dir = _handle_long_path(dir)
+        cpu_workers = max_workers or resolve_worker_counts(max_workers).cpu_workers
+    except Exception as exc:
+        setup_errors.append(
+            workflow_error_from_exception(
+                workflow="serialize",
+                phase="setup",
+                subject=str(dir),
+                exception=exc,
+                severity="fatal",
             )
-        except (OSError, NotImplementedError):
-            process_pool = _PROCESS_POOL_UNAVAILABLE
-            logger.warning("ProcessPoolExecutor unavailable for serializer; using serial mode", exc_info=True)
+        )
+        can_serialize = False
+
+    if can_serialize and cpu_workers > 1 and not isinstance(progress_sink, NoopProgressSink):
+        try:
+            multi_process_progress_manager = MultiProcessProgressManager(progress_sink)
+            multi_process_progress_manager.start()
+            progress_manager_started = True
+            active_progress_sink = (
+                multi_process_progress_manager.get_multi_process_progress_queue_sink()
+            )
+        except Exception as exc:
+            setup_errors.append(
+                workflow_error_from_exception(
+                    workflow="serialize",
+                    phase="progress_setup",
+                    subject=str(dir),
+                    exception=exc,
+                    severity="fatal",
+                )
+            )
+            active_progress_sink = NoopProgressSink()
+
+    if can_serialize:
+        try:
+            active_progress_sink.on_event(ProgressEvent.total_line(message="Serializing"))
+            total_count = Model.recalculate_total_object_count(model)
+            active_progress_sink.on_event(ProgressEvent.total_line(total=total_count))
+        except Exception as exc:
+            setup_errors.append(
+                workflow_error_from_exception(
+                    workflow="serialize",
+                    phase="progress",
+                    subject=str(dir),
+                    exception=exc,
+                    severity="fatal",
+                )
+            )
+            active_progress_sink = NoopProgressSink()
+
+        if cpu_workers > 1:
+            try:
+                multiprocessing.freeze_support()
+                process_pool = ProcessPoolExecutor(
+                    **process_pool_executor_kwargs(
+                        max_workers=int(cpu_workers),
+                        initializer=ignore_sigint_in_worker,
+                    ),
+                )
+            except (OSError, NotImplementedError):
+                process_pool = _PROCESS_POOL_UNAVAILABLE
+                logger.warning("ProcessPoolExecutor unavailable for serializer; using serial mode", exc_info=True)
 
     pool_shutdown_aggressive = False
     try:
-        if model.dimensions:
+        if can_serialize and model.dimensions:
             dim_dir = dir + '/dimensions'
-            os.makedirs(dim_dir, exist_ok=True)
-            serialize_dimensions(model.dimensions, dim_dir, process_pool=process_pool, progress_sink=active_progress_sink)
+            try:
+                logger.info("Serializing %d dimension(s) to '%s'", len(model.dimensions), dim_dir)
+                os.makedirs(dim_dir, exist_ok=True)
+                dimension_errors = serialize_dimensions(
+                    model.dimensions,
+                    dim_dir,
+                    process_pool=process_pool,
+                    progress_sink=active_progress_sink,
+                ) or []
+            except Exception as exc:
+                dimension_errors.append(
+                    workflow_error_from_exception(
+                        workflow="serialize",
+                        phase="dimensions",
+                        subject=dim_dir,
+                        exception=exc,
+                        severity="fatal",
+                    )
+                )
+            logger.info(
+                "Dimension serialization finished (diagnostics=%d)",
+                len(dimension_errors),
+            )
 
         cubes_dir = dir + '/cubes'
-        if model.cubes:
-            os.makedirs(cubes_dir, exist_ok=True)
-            serialize_cubes(model.cubes, cubes_dir, process_pool=process_pool, progress_sink=active_progress_sink)
+        if can_serialize and model.cubes:
+            try:
+                logger.info("Serializing %d cube(s) to '%s'", len(model.cubes), cubes_dir)
+                os.makedirs(cubes_dir, exist_ok=True)
+                cube_errors = serialize_cubes(
+                    model.cubes,
+                    cubes_dir,
+                    process_pool=process_pool,
+                    progress_sink=active_progress_sink,
+                ) or []
+            except Exception as exc:
+                cube_errors.append(
+                    workflow_error_from_exception(
+                        workflow="serialize",
+                        phase="cubes",
+                        subject=cubes_dir,
+                        exception=exc,
+                        severity="fatal",
+                    )
+                )
+            logger.info("Cube serialization finished (diagnostics=%d)", len(cube_errors))
 
         processes_dir = dir + '/processes'
-        if model.processes:
-            os.makedirs(processes_dir, exist_ok=True)
-            serialize_processes(model.processes, processes_dir, process_pool=process_pool, progress_sink=active_progress_sink)
+        if can_serialize and model.processes:
+            try:
+                logger.info("Serializing %d process(es) to '%s'", len(model.processes), processes_dir)
+                os.makedirs(processes_dir, exist_ok=True)
+                process_errors = serialize_processes(
+                    model.processes,
+                    processes_dir,
+                    process_pool=process_pool,
+                    progress_sink=active_progress_sink,
+                ) or []
+            except Exception as exc:
+                process_errors.append(
+                    workflow_error_from_exception(
+                        workflow="serialize",
+                        phase="processes",
+                        subject=processes_dir,
+                        exception=exc,
+                        severity="fatal",
+                    )
+                )
+            logger.info("Process serialization finished (diagnostics=%d)", len(process_errors))
 
         chores_dir = dir + '/chores'
-        if model.chores:
-            os.makedirs(chores_dir, exist_ok=True)
-            serialize_chores(model.chores, chores_dir, process_pool=process_pool, progress_sink=active_progress_sink)
+        if can_serialize and model.chores:
+            try:
+                logger.info("Serializing %d chore(s) to '%s'", len(model.chores), chores_dir)
+                os.makedirs(chores_dir, exist_ok=True)
+                chore_errors = serialize_chores(
+                    model.chores,
+                    chores_dir,
+                    process_pool=process_pool,
+                    progress_sink=active_progress_sink,
+                ) or []
+            except Exception as exc:
+                chore_errors.append(
+                    workflow_error_from_exception(
+                        workflow="serialize",
+                        phase="chores",
+                        subject=chores_dir,
+                        exception=exc,
+                        severity="fatal",
+                    )
+                )
+            logger.info("Chore serialization finished (diagnostics=%d)", len(chore_errors))
     except KeyboardInterrupt:
         pool_shutdown_aggressive = True
         raise
     finally:
         if isinstance(process_pool, ProcessPoolExecutor):
-            if pool_shutdown_aggressive:
-                dispose_process_pool(process_pool, mode="aggressive", log=True)
-            else:
-                dispose_process_pool(
-                    process_pool,
-                    mode="graceful_bounded",
-                    graceful_timeout_sec=SERIALIZER_POOL_GRACEFUL_SHUTDOWN_SEC,
-                    log=True,
+            try:
+                if pool_shutdown_aggressive:
+                    dispose_process_pool(process_pool, mode="aggressive", log=True)
+                else:
+                    dispose_process_pool(
+                        process_pool,
+                        mode="graceful_bounded",
+                        graceful_timeout_sec=SERIALIZER_POOL_GRACEFUL_SHUTDOWN_SEC,
+                        log=True,
+                    )
+            except Exception as exc:
+                cleanup_errors.append(
+                    workflow_error_from_exception(
+                        workflow="serialize",
+                        phase="process_pool_cleanup",
+                        subject=str(dir),
+                        exception=exc,
+                        severity="fatal",
+                    )
                 )
-        active_progress_sink.close()
-        if multi_process_progress_manager is not None:
-            multi_process_progress_manager.close()
-    logger.info("Model serialization finished for '%s'", dir)
+        try:
+            active_progress_sink.close()
+        except Exception as exc:
+            cleanup_errors.append(
+                workflow_error_from_exception(
+                    workflow="serialize",
+                    phase="progress_cleanup",
+                    subject=str(dir),
+                    exception=exc,
+                    severity="fatal",
+                )
+            )
+        if multi_process_progress_manager is not None and progress_manager_started:
+            try:
+                multi_process_progress_manager.close()
+            except Exception as exc:
+                cleanup_errors.append(
+                    workflow_error_from_exception(
+                        workflow="serialize",
+                        phase="progress_manager_cleanup",
+                        subject=str(dir),
+                        exception=exc,
+                        severity="fatal",
+                    )
+                )
+
+    errors: list[WorkflowError] = []
+    for phase_errors in (
+        setup_errors,
+        dimension_errors,
+        cube_errors,
+        process_errors,
+        chore_errors,
+        cleanup_errors,
+    ):
+        collect_worker_errors(
+            errors,
+            phase_errors,
+            error_callback=error_callback,
+        )
+    for error in errors:
+        log = logger.warning if error.severity == "recoverable" else logger.error
+        log(
+            "Serialization diagnostic workflow=%s phase=%s subject=%s exception=%s: %s",
+            error.workflow,
+            error.phase,
+            error.subject,
+            error.exception_type,
+            error.message,
+        )
+    logger.info(
+        "Model serialization finished for '%s' (diagnostics=%d recoverable=%d fatal=%d)",
+        dir,
+        len(errors),
+        sum(error.severity == "recoverable" for error in errors),
+        sum(error.severity == "fatal" for error in errors),
+    )
+    return errors
 
 
 def serialize_dimensions(
     dimensions: List[Dimension],
     dim_dir,
     process_pool: Optional[ProcessPoolExecutor],
-    progress_sink: ProgressSink,  
-):
+    progress_sink: ProgressSink,
+) -> list[WorkflowError]:
+    """Serialize dimensions and return hierarchy diagnostics to the coordinator."""
+    errors: list[WorkflowError] = []
     dimension_jobs = [
         (dim, _build_dimension_serialize_job(dim, dim_dir))
         for dim in dimensions
     ]
     if process_pool is None or process_pool is _PROCESS_POOL_UNAVAILABLE:
         for dim, job in dimension_jobs:
-            hierarchy_results = [
-                _serialize_hierarchy_job(hierarchy_job, progress_sink)
-                for hierarchy_job in job["hierarchies"]
-            ]
-            _finish_dimension_serialization(dim, job, hierarchy_results)
-        return
+            hierarchy_results: list[dict[str, str]] = []
+            for hierarchy_job in job["hierarchies"]:
+                metadata = _hierarchy_serialization_metadata(hierarchy_job)
+                try:
+                    hierarchy_results.append(
+                        _serialize_hierarchy_job(hierarchy_job, progress_sink)
+                    )
+                except Exception as exc:
+                    errors.append(
+                        workflow_error_from_exception(
+                            workflow="serialize",
+                            phase=metadata.phase,
+                            subject=metadata.target_path,
+                            exception=exc,
+                            severity="recoverable",
+                        )
+                    )
+            errors.extend(_finish_dimension_serialization(dim, job, hierarchy_results))
+        return errors
 
     pending_by_dimension: dict[int, int] = {}
     hierarchy_results_by_dimension: dict[int, list[dict[str, str]]] = {}
     jobs_by_dimension_id: dict[int, tuple[Dimension, dict[str, Any]]] = {}
-    future_to_dimension_id: dict[Any, int] = {}
+    future_to_job: dict[Any, _SubmittedSerializationJob] = {}
+    finalization_errors_by_dimension: dict[int, list[WorkflowError]] = {}
+    finished_dimensions: set[int] = set()
+    hierarchy_failures: list[tuple[int, WorkflowError]] = []
+    process_pool_failures: list[tuple[int, WorkflowError]] = []
+    submission_index = 0
 
     for dimension_id, (dim, job) in enumerate(dimension_jobs):
         jobs_by_dimension_id[dimension_id] = (dim, job)
         hierarchy_results_by_dimension[dimension_id] = []
         pending_by_dimension[dimension_id] = len(job["hierarchies"])
+        finalization_errors_by_dimension[dimension_id] = []
         if not job["hierarchies"]:
-            _finish_dimension_serialization(dim, job, [])
+            finalization_errors_by_dimension[dimension_id].extend(
+                _finish_dimension_serialization(dim, job, [])
+            )
+            finished_dimensions.add(dimension_id)
             continue
         progress_sink.on_event(ProgressEvent.worker_line(current=0, total=len(job["hierarchies"]), message=f"Serializing dimension {dim.name}"))
         for hierarchy_job in job["hierarchies"]:
-            future = process_pool.submit(_serialize_hierarchy_job, hierarchy_job, progress_sink)
-            future_to_dimension_id[future] = dimension_id
+            submitted_job = _SubmittedSerializationJob(
+                submission_index=submission_index,
+                dimension_id=dimension_id,
+                metadata=_hierarchy_serialization_metadata(hierarchy_job),
+            )
+            submission_index += 1
+            try:
+                future = process_pool.submit(
+                    _serialize_hierarchy_job,
+                    hierarchy_job,
+                    progress_sink,
+                )
+            except Exception as exc:
+                hierarchy_failures.append(
+                    (
+                        submitted_job.submission_index,
+                        _serialization_job_error(submitted_job.metadata, exc),
+                    )
+                )
+                if isinstance(exc, BrokenProcessPool):
+                    process_pool_failures.append(
+                        (
+                            submitted_job.submission_index,
+                            workflow_error_from_exception(
+                                workflow="serialize",
+                                phase="process_pool",
+                                subject=str(dim_dir),
+                                exception=exc,
+                                severity="fatal",
+                            ),
+                        )
+                    )
+                pending_by_dimension[dimension_id] -= 1
+            else:
+                future_to_job[future] = submitted_job
 
-    for future in as_completed(future_to_dimension_id):
-        dimension_id = future_to_dimension_id[future]
+    for future in as_completed(future_to_job):
+        submitted_job = future_to_job[future]
+        dimension_id = submitted_job.dimension_id
+        assert dimension_id is not None
         dim, job = jobs_by_dimension_id[dimension_id]
-        hierarchy_result = future.result()
-        hierarchy_results_by_dimension[dimension_id].append(hierarchy_result)
-        logger.debug(
-            "Serializer hierarchy job finished dimension=%s hierarchy=%s",
-            dim.name,
-            hierarchy_result.get("name"),
-        )
+        try:
+            hierarchy_result = future.result()
+        except Exception as exc:
+            hierarchy_failures.append(
+                (
+                    submitted_job.submission_index,
+                    workflow_error_from_exception(
+                        workflow="serialize",
+                        phase=submitted_job.metadata.phase,
+                        subject=submitted_job.metadata.target_path,
+                        exception=exc,
+                        severity="recoverable",
+                    ),
+                )
+            )
+            if isinstance(exc, BrokenProcessPool):
+                process_pool_failures.append(
+                    (
+                        submitted_job.submission_index,
+                        workflow_error_from_exception(
+                            workflow="serialize",
+                            phase="process_pool",
+                            subject=str(dim_dir),
+                            exception=exc,
+                            severity="fatal",
+                        ),
+                    )
+                )
+        else:
+            hierarchy_results_by_dimension[dimension_id].append(hierarchy_result)
         pending_by_dimension[dimension_id] -= 1
         completed = len(job["hierarchies"]) - pending_by_dimension[dimension_id]
         progress_sink.on_event(ProgressEvent.worker_line(current=completed, total=len(job["hierarchies"]), message=f"Serializing dimension {dim.name}"))
         if pending_by_dimension[dimension_id] == 0:
-            _finish_dimension_serialization(
-                dim,
-                job,
-                hierarchy_results_by_dimension[dimension_id],
+            finalization_errors_by_dimension[dimension_id].extend(
+                _finish_dimension_serialization(
+                    dim,
+                    job,
+                    hierarchy_results_by_dimension[dimension_id],
+                )
             )
+            finished_dimensions.add(dimension_id)
+    errors.extend(error for _, error in sorted(hierarchy_failures))
+    if process_pool_failures:
+        errors.append(sorted(process_pool_failures)[0][1])
+    for dimension_id in range(len(dimension_jobs)):
+        if pending_by_dimension[dimension_id] == 0 and dimension_id not in finished_dimensions:
+            dim, job = jobs_by_dimension_id[dimension_id]
+            finalization_errors_by_dimension[dimension_id].extend(
+                _finish_dimension_serialization(
+                    dim,
+                    job,
+                    hierarchy_results_by_dimension[dimension_id],
+                )
+            )
+            finished_dimensions.add(dimension_id)
+        errors.extend(finalization_errors_by_dimension[dimension_id])
+    return errors
 
 
 def _finish_dimension_serialization(
     dim: Dimension,
     job: dict[str, Any],
     hierarchy_results: list[dict[str, str]],
-) -> None:
+) -> list[WorkflowError]:
     _write_text_staged(job["dimension_path"], job["dimension_json"])
-    _finalize_dimension_serialize_result(dim, hierarchy_results)
+    return _finalize_dimension_serialize_result(dim, hierarchy_results)
 
 
-def _finalize_dimension_serialize_result(dim: Dimension, hierarchy_results: list[dict[str, str]]) -> None:
+def _finalize_dimension_serialize_result(
+    dim: Dimension,
+    hierarchy_results: list[dict[str, str]],
+) -> list[WorkflowError]:
+    errors: list[WorkflowError] = []
     for hierarchy_result in hierarchy_results:
         hierarchy = _hierarchy_by_name(dim, hierarchy_result["name"])
         if hierarchy is None:
             continue
-        _set_source_json_mtime_from_path(hierarchy, hierarchy_result["source_mtime_path"])
+        errors.extend(
+            _set_source_json_mtime_from_path(
+                hierarchy,
+                hierarchy_result["source_mtime_path"],
+            )
+        )
+    return errors
 
 
 def _hierarchy_by_name(dim: Dimension, hierarchy_name: str) -> Optional[Hierarchy]:
     return next((hierarchy for hierarchy in dim.hierarchies if hierarchy.name == hierarchy_name), None)
+
+
+def _hierarchy_serialization_metadata(
+    hierarchy_job: dict[str, Any],
+) -> SerializationJobMetadata:
+    dimension_name = str(hierarchy_job["dimension_name"])
+    hierarchy_name = str(hierarchy_job["name"])
+    return SerializationJobMetadata(
+        phase="hierarchy",
+        object_type="hierarchy",
+        object_name=f"{dimension_name}/{hierarchy_name}",
+        target_path=str(hierarchy_job["target_path"]),
+        dimension_name=dimension_name,
+        hierarchy_name=hierarchy_name,
+    )
 
 
 def _build_hierarchy_serialize_job(dim: Dimension, hierarchy: Hierarchy, dim_dir: str) -> dict[str, Any]:
@@ -742,23 +1095,49 @@ def _write_store_backed_subsets(subsets_dir: str, store: dict[str, Any]) -> None
         conn.close()
 
 
-def _set_source_json_mtime_from_path(hierarchy, hierarchy_json_path: str) -> None:
+def _set_source_json_mtime_from_path(
+    hierarchy,
+    hierarchy_json_path: str,
+) -> list[WorkflowError]:
     try:
         source_json_mtime_ns = int(os.stat(hierarchy_json_path).st_mtime_ns)
-    except OSError:
-        logger.debug("Cannot stat serialized hierarchy file '%s'", hierarchy_json_path, exc_info=True)
-        return
+    except OSError as exc:
+        return [
+            workflow_error_from_exception(
+                workflow="serialize",
+                phase="hierarchy_metadata",
+                subject=hierarchy_json_path,
+                exception=exc,
+                severity="recoverable",
+            )
+        ]
     for sequence in (hierarchy.elements, hierarchy.edges, hierarchy.subsets):
         if hasattr(sequence, "set_source_json_mtime_ns"):
             sequence.set_source_json_mtime_ns(source_json_mtime_ns)
+    return []
 
 
-def serialize_cubes(cubes: List[Cube], cubes_dir, process_pool: Optional[ProcessPoolExecutor], progress_sink: ProgressSink):
-    logger.debug("Serializing %d cube(s) into '%s'", len(cubes), cubes_dir)
-    _run_io_jobs(
-        ((_serialize_cube, (_build_cube_serialize_job(cube), cubes_dir, progress_sink)) for cube in cubes),
+def serialize_cubes(
+    cubes: List[Cube],
+    cubes_dir,
+    process_pool: Optional[ProcessPoolExecutor],
+    progress_sink: ProgressSink,
+) -> list[WorkflowError]:
+    return _run_io_jobs(
+        (
+            (
+                _serialize_cube,
+                (_build_cube_serialize_job(cube), cubes_dir, progress_sink),
+                SerializationJobMetadata(
+                    phase="cube",
+                    object_type="cube",
+                    object_name=cube.name,
+                    target_path=os.path.join(cubes_dir, cube.name + ".json"),
+                ),
+            )
+            for cube in cubes
+        ),
         process_pool=process_pool,
-        log_phase="cube",
     )
 
 
@@ -817,11 +1196,27 @@ def _serialize_cube(cube_job: dict[str, Any], cubes_dir: str, progress_sink: Pro
     progress_sink.on_event(ProgressEvent.worker_line(current=1, total=1, message=f"Serializing cube {cube_name}"))
 
 
-def serialize_processes(processes: List[Process], process_dir, process_pool: Optional[ProcessPoolExecutor], progress_sink: ProgressSink):
-    _run_io_jobs(
-        ((_serialize_process, (process, process_dir, progress_sink)) for process in processes),
+def serialize_processes(
+    processes: List[Process],
+    process_dir,
+    process_pool: Optional[ProcessPoolExecutor],
+    progress_sink: ProgressSink,
+) -> list[WorkflowError]:
+    return _run_io_jobs(
+        (
+            (
+                _serialize_process,
+                (process, process_dir, progress_sink),
+                SerializationJobMetadata(
+                    phase="process",
+                    object_type="process",
+                    object_name=process.name,
+                    target_path=os.path.join(process_dir, process.name + ".json"),
+                ),
+            )
+            for process in processes
+        ),
         process_pool=process_pool,
-        log_phase="process",
     )
 
 
@@ -835,12 +1230,27 @@ def _serialize_process(process: Process, process_dir: str, progress_sink: Progre
     progress_sink.on_event(ProgressEvent.worker_line(current=1, total=1, message=f"Serializing process {process.name}"))
 
 
-def serialize_chores(chores: List[Chore], chores_dir, process_pool: Optional[ProcessPoolExecutor], progress_sink: ProgressSink):
-    logger.debug("Serializing %d chore(s) into '%s'", len(chores), chores_dir)
-    _run_io_jobs(
-        ((_serialize_chore, (chore, chores_dir, progress_sink)) for chore in chores),
+def serialize_chores(
+    chores: List[Chore],
+    chores_dir,
+    process_pool: Optional[ProcessPoolExecutor],
+    progress_sink: ProgressSink,
+) -> list[WorkflowError]:
+    return _run_io_jobs(
+        (
+            (
+                _serialize_chore,
+                (chore, chores_dir, progress_sink),
+                SerializationJobMetadata(
+                    phase="chore",
+                    object_type="chore",
+                    object_name=chore.name,
+                    target_path=os.path.join(chores_dir, chore.name + ".json"),
+                ),
+            )
+            for chore in chores
+        ),
         process_pool=process_pool,
-        log_phase="chore",
     )
 
 
@@ -855,17 +1265,85 @@ def _run_io_jobs(
     jobs,
     *,
     process_pool: Optional[ProcessPoolExecutor] = None,
-    log_phase: Optional[str] = None,
-) -> None:
-    if process_pool is None:
-        for fn, args in jobs:
-            fn(*args)
-        return
-    futures = [process_pool.submit(fn, *args) for fn, args in jobs]
-    total = len(futures)
-    done = 0
-    for future in as_completed(futures):
-        future.result()
-        done += 1
-        if log_phase is not None:
-            logger.debug("Serializer %s job progress %d/%d", log_phase, done, total)
+) -> list[WorkflowError]:
+    """Run independent file jobs and collect failures in submission order."""
+    errors: list[WorkflowError] = []
+    if process_pool is None or process_pool is _PROCESS_POOL_UNAVAILABLE:
+        for fn, args, metadata in jobs:
+            try:
+                fn(*args)
+            except Exception as exc:
+                errors.append(_serialization_job_error(metadata, exc))
+        return errors
+
+    future_to_job: dict[Any, _SubmittedSerializationJob] = {}
+    job_failures: list[tuple[int, WorkflowError]] = []
+    process_pool_failures: list[tuple[int, WorkflowError]] = []
+    for submission_index, (fn, args, metadata) in enumerate(jobs):
+        submitted_job = _SubmittedSerializationJob(
+            submission_index=submission_index,
+            metadata=metadata,
+        )
+        try:
+            future = process_pool.submit(fn, *args)
+        except Exception as exc:
+            job_failures.append(
+                (submission_index, _serialization_job_error(metadata, exc))
+            )
+            if isinstance(exc, BrokenProcessPool):
+                process_pool_failures.append(
+                    (
+                        submission_index,
+                        workflow_error_from_exception(
+                            workflow="serialize",
+                            phase="process_pool",
+                            subject=metadata.target_path,
+                            exception=exc,
+                            severity="fatal",
+                        ),
+                    )
+                )
+        else:
+            future_to_job[future] = submitted_job
+
+    for future in as_completed(future_to_job):
+        submitted_job = future_to_job[future]
+        try:
+            future.result()
+        except Exception as exc:
+            job_failures.append(
+                (
+                    submitted_job.submission_index,
+                    _serialization_job_error(submitted_job.metadata, exc),
+                )
+            )
+            if isinstance(exc, BrokenProcessPool):
+                process_pool_failures.append(
+                    (
+                        submitted_job.submission_index,
+                        workflow_error_from_exception(
+                            workflow="serialize",
+                            phase="process_pool",
+                            subject=submitted_job.metadata.target_path,
+                            exception=exc,
+                            severity="fatal",
+                        ),
+                    )
+                )
+    errors.extend(error for _, error in sorted(job_failures))
+    if process_pool_failures:
+        errors.append(sorted(process_pool_failures)[0][1])
+    return errors
+
+
+def _serialization_job_error(
+    metadata: SerializationJobMetadata,
+    exception: BaseException,
+) -> WorkflowError:
+    return workflow_error_from_exception(
+        workflow="serialize",
+        phase=metadata.phase,
+        subject=metadata.target_path,
+        exception=exception,
+        severity="recoverable",
+    )
