@@ -32,6 +32,12 @@ from tm1_git_py.reporting.progress_reporting import (
     ProgressEvent,
     ProgressSink,
 )
+from tm1_git_py.reporting.error_reporting import (
+    ErrorCallback,
+    WorkflowError,
+    collect_worker_errors,
+    workflow_error_from_exception,
+)
 from tm1_git_py.services.filter import (
     EntityType,
     FilterRules,
@@ -86,6 +92,14 @@ class _InlineExecutor:
 @dataclass
 class PageFuture:
     skip: int
+    top: int
+    future: Future
+
+
+@dataclass
+class CountFuture:
+    hierarchy_future: "HierarchyFuture"
+    page_kind: str
     future: Future
 
 
@@ -106,6 +120,17 @@ class HierarchyFuture:
         return [
             page.future
             for pages in (self.element_pages, self.edge_pages, self.subset_pages)
+            for page in pages
+        ]
+
+    def page_futures_with_context(self) -> list[tuple[str, PageFuture]]:
+        return [
+            (page_kind, page)
+            for page_kind, pages in (
+                ("elements", self.element_pages),
+                ("edges", self.edge_pages),
+                ("subsets", self.subset_pages),
+            )
             for page in pages
         ]
 
@@ -130,42 +155,41 @@ class HierarchyFuture:
     def subset_done(self) -> bool:
         return all(page.future.done() for page in self.subset_pages)
 
-    def add_page(self, page_kind: str, *, skip: int, future: Future) -> None:
-        self.pages_for(page_kind).append(PageFuture(skip=skip, future=future))
-        future.add_done_callback(lambda _future: self._maybe_notify_done(page_kind))
+    def add_page(self, page_kind: str, *, skip: int, top: int, future: Future) -> None:
+        self.pages_for(page_kind).append(
+            PageFuture(skip=skip, top=top, future=future)
+        )
 
     def add_elements_done_callback(self, fn: Callable[["HierarchyFuture"], None]) -> None:
-        if self.elements_done:
-            fn(self)
-            return
         self._elements_done_callbacks.append(fn)
 
     def add_edges_done_callback(self, fn: Callable[["HierarchyFuture"], None]) -> None:
-        if self.edges_done:
-            fn(self)
-            return
         self._edges_done_callbacks.append(fn)
 
     def add_subset_done_callback(self, fn: Callable[["HierarchyFuture"], None]) -> None:
-        if self.subset_done:
-            fn(self)
-            return
         self._subset_done_callbacks.append(fn)
 
     def _notify_callbacks(self, callbacks: list[Callable[["HierarchyFuture"], None]]) -> None:
         for callback in callbacks:
             callback(self)
 
-    def _maybe_notify_done(self, page_kind: str) -> None:
-        if page_kind == "elements" and self.elements_done and self._elements_done_callbacks:
+    def notify_successful_page_kind(self, page_kind: str) -> None:
+        """Run dependent completion work from the export coordinator.
+
+        The caller must first resolve every future for the page kind and call
+        this only if they all succeeded. This prevents completion callbacks
+        from persisting etags or hashes for an incomplete hierarchy.
+        """
+
+        if page_kind == "elements" and self._elements_done_callbacks:
             callbacks = self._elements_done_callbacks
             self._elements_done_callbacks = []
             self._notify_callbacks(callbacks)
-        elif page_kind == "edges" and self.edges_done and self._edges_done_callbacks:
+        elif page_kind == "edges" and self._edges_done_callbacks:
             callbacks = self._edges_done_callbacks
             self._edges_done_callbacks = []
             self._notify_callbacks(callbacks)
-        elif page_kind == "subsets" and self.subset_done and self._subset_done_callbacks:
+        elif page_kind == "subsets" and self._subset_done_callbacks:
             callbacks = self._subset_done_callbacks
             self._subset_done_callbacks = []
             self._notify_callbacks(callbacks)
@@ -178,48 +202,103 @@ def export(
     *,
     progress_sink: Optional[ProgressSink] = None,
     max_workers: Optional[int] = None,
-) -> tuple[Model, Dict[str, str]]:
-
-    logger.info(f"exporting model {model_id} with max_workers {max_workers}")
-
+    error_callback: Optional[ErrorCallback] = None,
+) -> tuple[Model, list[WorkflowError]]:
     progress_sink = progress_sink if progress_sink is not None else NoopProgressSink()
-    multi_process_progress_manager: Optional[MultiProcessProgressManager] = None
-    if resolve_worker_counts(max_workers).cpu_workers > 1 and not isinstance(progress_sink, NoopProgressSink):
-        multi_process_progress_manager = MultiProcessProgressManager(progress_sink)
-        multi_process_progress_manager.start()
-        active_progress_sink = multi_process_progress_manager.get_multi_process_progress_queue_sink()
-    else:
-        active_progress_sink = progress_sink
-
     worker_counts = resolve_worker_counts(max_workers)
     filter_rules = apply_default_filter_rules(filter_rules)
 
-    progress_sink.on_event(ProgressEvent.total_line(message="Exporting"))
-    
+    logger.info(
+        "Starting TM1 export model_id=%s max_workers=%s",
+        model_id,
+        worker_counts.max_workers,
+    )
+
+    multi_process_progress_manager: Optional[MultiProcessProgressManager] = None
+    _dimensions: Dict[str, Dimension] = {}
+    _cubes: Dict[str, Cube] = {}
+    _processes: Dict[str, Process] = {}
+    _chores: Dict[str, Chore] = {}
+    _dim_errors: list[WorkflowError] = []
+    _cube_errors: list[WorkflowError] = []
+    _process_errors: list[WorkflowError] = []
+    _chore_errors: list[WorkflowError] = []
     try:
-        _dimensions, _dim_errors = dimensions_to_model(
-            tm1_conn,
-            model_id=model_id,
-            filter_rules=filter_rules,
-            progress_sink=active_progress_sink,
-            worker_counts=worker_counts,
-        )
-        _cubes, _cube_errors = cubes_to_model(
-            tm1_conn,
-            _dimensions,
-            filter_rules=filter_rules,
-            progress_sink=active_progress_sink,
-        )
-        _processes, _process_errors = procs_to_model(
-            tm1_conn,
-            filter_rules=filter_rules,
-            progress_sink=active_progress_sink,
-        )
-        _chores, _chore_errors = chores_to_model(
-            tm1_conn,
-            filter_rules=filter_rules,
-            progress_sink=active_progress_sink,
-        )
+        if worker_counts.cpu_workers > 1 and not isinstance(progress_sink, NoopProgressSink):
+            multi_process_progress_manager = MultiProcessProgressManager(progress_sink)
+            multi_process_progress_manager.start()
+            active_progress_sink = multi_process_progress_manager.get_multi_process_progress_queue_sink()
+        else:
+            active_progress_sink = progress_sink
+
+        progress_sink.on_event(ProgressEvent.total_line(message="Exporting"))
+        try:
+            _dimensions, _dim_errors = dimensions_to_model(
+                tm1_conn,
+                model_id=model_id,
+                filter_rules=filter_rules,
+                progress_sink=active_progress_sink,
+                worker_counts=worker_counts,
+            )
+        except Exception as exc:
+            _dim_errors.append(
+                workflow_error_from_exception(
+                    workflow="export",
+                    phase="dimensions",
+                    subject=model_id,
+                    exception=exc,
+                    severity="fatal",
+                )
+            )
+        try:
+            _cubes, _cube_errors = cubes_to_model(
+                tm1_conn,
+                _dimensions,
+                filter_rules=filter_rules,
+                progress_sink=active_progress_sink,
+            )
+        except Exception as exc:
+            _cube_errors.append(
+                workflow_error_from_exception(
+                    workflow="export",
+                    phase="cubes",
+                    subject=model_id,
+                    exception=exc,
+                    severity="fatal",
+                )
+            )
+        try:
+            _processes, _process_errors = procs_to_model(
+                tm1_conn,
+                filter_rules=filter_rules,
+                progress_sink=active_progress_sink,
+            )
+        except Exception as exc:
+            _process_errors.append(
+                workflow_error_from_exception(
+                    workflow="export",
+                    phase="processes",
+                    subject=model_id,
+                    exception=exc,
+                    severity="fatal",
+                )
+            )
+        try:
+            _chores, _chore_errors = chores_to_model(
+                tm1_conn,
+                filter_rules=filter_rules,
+                progress_sink=active_progress_sink,
+            )
+        except Exception as exc:
+            _chore_errors.append(
+                workflow_error_from_exception(
+                    workflow="export",
+                    phase="chores",
+                    subject=model_id,
+                    exception=exc,
+                    severity="fatal",
+                )
+            )
     finally:
         if multi_process_progress_manager is not None:
             multi_process_progress_manager.close()
@@ -237,36 +316,53 @@ def export(
         len(_model.processes),
         len(_model.chores),
     )
-    _errors = {}
-    _errors['dim'] = _dim_errors
-    _errors['cube'] = _cube_errors
-    _errors['process'] = _process_errors
-    _errors['chore'] = _chore_errors
+    errors: list[WorkflowError] = []
+    for helper_errors in (
+        _dim_errors,
+        _cube_errors,
+        _process_errors,
+        _chore_errors,
+    ):
+        collect_worker_errors(
+            errors,
+            helper_errors,
+            error_callback=error_callback,
+        )
 
-    total_errors = sum(len(category_errors) for category_errors in _errors.values())
-    if total_errors:
+    if errors:
+        recoverable_errors = sum(error.severity == "recoverable" for error in errors)
+        fatal_errors = len(errors) - recoverable_errors
+        for error in errors:
+            logger.log(
+                logging.ERROR if error.severity == "fatal" else logging.WARNING,
+                "TM1 export error workflow=%s phase=%s subject=%s type=%s message=%s",
+                error.workflow,
+                error.phase,
+                error.subject,
+                error.exception_type,
+                error.message,
+            )
         logger.warning(
-            "TM1 export completed with errors: dimensions=%d cubes=%d processes=%d chores=%d",
-            len(_dim_errors),
-            len(_cube_errors),
-            len(_process_errors),
-            len(_chore_errors),
+            "TM1 export completed with errors total=%d recoverable=%d fatal=%d",
+            len(errors),
+            recoverable_errors,
+            fatal_errors,
         )
     else:
         logger.info("TM1 export completed without errors")
 
-    return _model, _errors
+    return _model, errors
 
 
 def chores_to_model(
     tm1_conn,
     filter_rules: FilterRules,
     progress_sink: Optional[ProgressSink] = None
-) -> tuple[Dict[str, Chore], Dict[str, str]]:
+) -> tuple[Dict[str, Chore], list[WorkflowError]]:
     progress_sink = progress_sink if progress_sink is not None else NoopProgressSink()
     all_chores = tm1_conn.chores.get_all_names()
     _chores: Dict[str, Chore] = {}
-    _errors: Dict[str, str] = {}
+    _errors: list[WorkflowError] = []
     skipped_chores = 0
     skipped_tasks = 0
     logger.info("Exporting %d chores", len(all_chores))
@@ -277,7 +373,6 @@ def chores_to_model(
         try:
             chore_url = Chore.uri_for(chore_name)
             if filter_rules.should_exclude(chore_url):
-                logger.debug("Skipping chore by filter: %s", chore_url)
                 skipped_chores += 1
                 continue
 
@@ -293,7 +388,6 @@ def chores_to_model(
                     process_name = match.group(1)
                 task_path = f"{chore_url}/Tasks('{process_name}')"
                 if filter_rules.should_exclude(task_path):
-                    logger.debug("Skipping chore task by filter: %s", task_path)
                     skipped_tasks += 1
                     continue
 
@@ -313,6 +407,16 @@ def chores_to_model(
                 tasks=tasks_for_model,
             )
             _chores[chore.name] = _chore
+        except Exception as exc:
+            _errors.append(
+                workflow_error_from_exception(
+                    workflow="export",
+                    phase="chores",
+                    subject=Chore.uri_for(chore_name),
+                    exception=exc,
+                    severity="recoverable",
+                )
+            )
         finally:
             progress_sink.on_event(ProgressEvent.total_line(current_delta=1))
             progress_sink.on_event(ProgressEvent.worker_line(current=1, total=1, message=f"Fetching chore {chore_name}"))
@@ -331,7 +435,7 @@ def procs_to_model(
     tm1_conn :TM1Service,
     filter_rules: FilterRules,
     progress_sink: Optional[ProgressSink] = None
-) -> tuple[Dict[str, Process], Dict[str, str]]:
+) -> tuple[Dict[str, Process], list[WorkflowError]]:
     progress_sink = progress_sink if progress_sink is not None else NoopProgressSink()
     processes_tm1_filter = filter_rules.to_tm1_name_filter(EntityType.PROCESS)
     filtered_process_names = [] if processes_tm1_filter.skip_all else get_process_names(
@@ -340,7 +444,7 @@ def procs_to_model(
     )
 
     _processes: Dict[str, Process] = {}
-    _errors: Dict[str, str] = {}
+    _errors: list[WorkflowError] = []
     logger.info("Exporting %d processes", len(filtered_process_names))
 
     progress_sink.on_event(ProgressEvent.total_line(total_delta=len(filtered_process_names)))
@@ -353,8 +457,16 @@ def procs_to_model(
             if raw_body:
                 try:
                     process_body = json.loads(raw_body)
-                except (TypeError, json.JSONDecodeError):
-                    logger.warning("Failed to parse process body for %s", process_name, exc_info=True)
+                except (TypeError, json.JSONDecodeError) as exc:
+                    _errors.append(
+                        workflow_error_from_exception(
+                            workflow="export",
+                            phase="process_body",
+                            subject=Process.uri_for(process_name),
+                            exception=exc,
+                            severity="recoverable",
+                        )
+                    )
 
             _ti = TI(prolog_procedure=process.prolog_procedure,
                      metadata_procedure=process.metadata_procedure,
@@ -367,6 +479,16 @@ def procs_to_model(
                                variables_ui_data=process_body.get("VariablesUIData"),
                                ui_data=process_body.get("UIData"))
             _processes[process.name] = _process
+        except Exception as exc:
+            _errors.append(
+                workflow_error_from_exception(
+                    workflow="export",
+                    phase="processes",
+                    subject=Process.uri_for(process_name),
+                    exception=exc,
+                    severity="recoverable",
+                )
+            )
         finally:
             progress_sink.on_event(ProgressEvent.total_line(current_delta=1))
             progress_sink.on_event(ProgressEvent.worker_line(current=1, total=1, message=f"Fetching process {process_name}"))
@@ -383,7 +505,7 @@ def cubes_to_model(
     _dimensions: Dict[str, Dimension],
     filter_rules: FilterRules,
     progress_sink: Optional[ProgressSink] = None
-) -> tuple[Dict[str, Cube], Dict[str, str]]:
+) -> tuple[Dict[str, Cube], list[WorkflowError]]:
     progress_sink = progress_sink if progress_sink is not None else NoopProgressSink()
     cubes_tm1_filter = filter_rules.to_tm1_name_filter(EntityType.CUBE)
     filtered_cube_names = [] if cubes_tm1_filter.skip_all else get_cube_names(
@@ -392,10 +514,11 @@ def cubes_to_model(
     )
 
     _cubes: Dict[str, Cube] = {}
-    _errors: Dict[str, str] = {}
+    _errors: list[WorkflowError] = []
     skipped_rules = 0
     skipped_views = 0
 
+    logger.info("Exporting %d cubes", len(filtered_cube_names))
     progress_sink.on_event(ProgressEvent.total_line(total_delta=len(filtered_cube_names)))
     progress_sink.on_event(ProgressEvent.worker_line(current=0, total=len(filtered_cube_names), message=f"Fetching cubes"))
    
@@ -415,7 +538,6 @@ def cubes_to_model(
             for rule in rules_list:
                 rule_path = f"{Rule.uri_for(cube_name)}|{normalize_for_path(rule.area)}"
                 if filter_rules.should_exclude(rule_path):
-                    logger.debug("Skipping rule by filter: %s", rule_path)
                     skipped_rules += 1
                     continue
                 filtered_rules_list.append(rule)
@@ -462,8 +584,15 @@ def cubes_to_model(
 
 
         except Exception as e:
-            logger.error("Failed to export cube '%s'", cube_name, exc_info=True)
-            _errors[cube_name] = str(e)
+            _errors.append(
+                workflow_error_from_exception(
+                    workflow="export",
+                    phase="cubes",
+                    subject=Cube.uri_for(cube_name),
+                    exception=e,
+                    severity="recoverable",
+                )
+            )
         finally:
             progress_sink.on_event(ProgressEvent.total_line(current_delta=1))
             progress_sink.on_event(ProgressEvent.worker_line(current=1, total=1, message=f"Fetching Cube {cube_name}"))
@@ -506,12 +635,6 @@ def _extract_drillthrough_rules(
             return []
         drill_cube = tm1_conn.cubes.get(cube_name=drill_cube_name)
     except Exception:
-        logger.debug(
-            "No drillthrough rule cube resolved for '%s' via '%s'",
-            cube_name,
-            drill_cube_name,
-            exc_info=True,
-        )
         return []
 
     drillthrough_rule_text = _extract_cube_rule_text(drill_cube)
@@ -526,7 +649,6 @@ def _extract_drillthrough_rules(
     )
     rule_path = f"{_drillthrough_rule_uri(cube_name)}|{normalize_for_path(rule.area)}"
     if filter_rules.should_exclude(rule_path):
-        logger.debug("Skipping drillthrough rule by filter: %s", rule_path)
         return []
     return [rule]
 
@@ -538,16 +660,18 @@ def dimensions_to_model(
     *,
     progress_sink: ProgressSink,
     worker_counts: WorkerCounts,
-) -> tuple[Dict[str, Dimension], Dict[str, str]]:
+) -> tuple[Dict[str, Dimension], list[WorkflowError]]:
 
     dimensions_tm1_filter = filter_rules.to_tm1_name_filter(EntityType.DIMENSION)
     all_dims = [] if dimensions_tm1_filter.skip_all else get_dimension_names(
         tm1_conn,
         filter=dimensions_tm1_filter.filter_expr,
     )
-    _errors: Dict[str, str] = {}
+    _errors: list[WorkflowError] = []
     _dimensions: Dict[str, Dimension] = {}
     model_store = ModelStore.for_model_id(model_id)
+
+    logger.info("Exporting %d dimensions", len(all_dims))
 
     cpu_workers = worker_counts.cpu_workers
     io_workers = worker_counts.io_workers
@@ -560,7 +684,7 @@ def dimensions_to_model(
     with ContentHashCalculator(db_path=model_store.db_path, max_workers=cpu_workers, progress_sink=progress_sink) as content_hash_calculator, \
             io_executor as executor:
         hierarchy_futures: list[HierarchyFuture] = []
-        count_futures: list[tuple[HierarchyFuture, str, Future]] = []
+        count_futures: list[CountFuture] = []
 
         def _compute_and_commit_hash(group_id: int, page_kind: str, expected_tm1_count: int) -> tuple[int, str]:
             progress_sink.on_event(ProgressEvent.worker_line(current=0, total=1, message=f"Calculating hash {group_id}"))
@@ -661,7 +785,12 @@ def dimensions_to_model(
                         mutable_list,
                         priority=100,
                     )
-                    hierarchy_future.add_page(page_kind, skip=i, future=future)
+                    hierarchy_future.add_page(
+                        page_kind,
+                        skip=i,
+                        top=100_000,
+                        future=future,
+                    )
                 done_callback(hierarchy_future)
             else:
                 progress_sink.on_event(ProgressEvent.total_line(current_delta=count))
@@ -819,7 +948,13 @@ def dimensions_to_model(
                             lambda hf, _cb=kind_callback, _add_done=add_done_callback: _add_done(hf, _cb),
                             priority=0,
                         )
-                        count_futures.append((hierarchy_future, page_kind, count_future))
+                        count_futures.append(
+                            CountFuture(
+                                hierarchy_future=hierarchy_future,
+                                page_kind=page_kind,
+                                future=count_future,
+                            )
+                        )
 
                 if hierarchy_list:
                     _dimension = Dimension(
@@ -836,37 +971,156 @@ def dimensions_to_model(
                     )
                 _dimensions[dim_name] = _dimension
             except Exception as e:
-                logger.error("Failed to export dimension '%s'", dim_name, exc_info=True)
-                _errors[dim_name] = str(e)
+                _errors.append(
+                    workflow_error_from_exception(
+                        workflow="export",
+                        phase="dimensions",
+                        subject=Dimension.uri_for(dim_name),
+                        exception=e,
+                        severity="recoverable",
+                    )
+                )
 
+        page_kind_order = {"elements": 0, "edges": 1, "subsets": 2}
+        hierarchy_order = {
+            id(hierarchy_future): index
+            for index, hierarchy_future in enumerate(hierarchy_futures)
+        }
+        future_errors: list[tuple[tuple[int, int, int, int], WorkflowError]] = []
         failed_hierarchy_ids: set[int] = set()
+        successful_count_kinds: set[tuple[int, str]] = set()
         if count_futures:
-            wait([future for _, _, future in count_futures])
-            for hierarchy_future, page_kind, future in count_futures:
+            wait([count_future.future for count_future in count_futures])
+            for count_future in count_futures:
+                hierarchy_future = count_future.hierarchy_future
+                page_kind = count_future.page_kind
                 try:
-                    future.result()
+                    count_future.future.result()
+                    successful_count_kinds.add((id(hierarchy_future), page_kind))
                 except Exception as e:
-                    failed_hierarchy_ids.add(id(hierarchy_future))
-                    key = f"{hierarchy_future.dimension_name}/{hierarchy_future.hierarchy.name}/{page_kind}:count"
-                    logger.error("Failed to count hierarchy pages '%s'", key, exc_info=True)
-                    _errors[key] = str(e)
+                    failed_hierarchy_ids.add(id(hierarchy_future.hierarchy))
+                    hierarchy_uri = Hierarchy.uri_for(
+                        dimension_name=hierarchy_future.dimension_name,
+                        hierarchy_name=hierarchy_future.hierarchy.name,
+                    )
+                    future_errors.append(
+                        (
+                            (
+                                hierarchy_order[id(hierarchy_future)],
+                                page_kind_order[page_kind],
+                                0,
+                                0,
+                            ),
+                            workflow_error_from_exception(
+                                workflow="export",
+                                phase="hierarchy_count",
+                                subject=hierarchy_uri,
+                                exception=e,
+                                severity="recoverable",
+                            ),
+                        )
+                    )
 
         page_futures = [
-            (hierarchy_future, future)
+            (hierarchy_future, page_kind, page_future)
             for hierarchy_future in hierarchy_futures
-            for future in hierarchy_future.all_futures
+            for page_kind, page_future in hierarchy_future.page_futures_with_context()
         ]
         if page_futures:
-            wait([future for _, future in page_futures])
-            for hierarchy_future, future in page_futures:
+            wait([page_future.future for _, _, page_future in page_futures])
+            for hierarchy_future, page_kind, page_future in page_futures:
                 try:
-                    future.result()
+                    page_future.future.result()
                 except Exception as e:
-                    failed_hierarchy_ids.add(id(hierarchy_future))
-                    key = f"{hierarchy_future.dimension_name}/{hierarchy_future.hierarchy.name}"
-                    logger.error("Failed to export hierarchy page '%s'", key, exc_info=True)
-                    _errors[key] = str(e)
+                    failed_hierarchy_ids.add(id(hierarchy_future.hierarchy))
+                    hierarchy_uri = Hierarchy.uri_for(
+                        dimension_name=hierarchy_future.dimension_name,
+                        hierarchy_name=hierarchy_future.hierarchy.name,
+                    )
+                    future_errors.append(
+                        (
+                            (
+                                hierarchy_order[id(hierarchy_future)],
+                                page_kind_order[page_kind],
+                                1,
+                                page_future.skip,
+                            ),
+                            workflow_error_from_exception(
+                                workflow="export",
+                                phase="hierarchy_page",
+                                subject=(
+                                    f"{hierarchy_uri}?$skip={page_future.skip}"
+                                    f"&$top={page_future.top}"
+                                ),
+                                exception=e,
+                                severity="recoverable",
+                            ),
+                        )
+                    )
 
+        for hierarchy_future in hierarchy_futures:
+            if id(hierarchy_future.hierarchy) in failed_hierarchy_ids:
+                continue
+            for page_kind in page_kind_order:
+                if (id(hierarchy_future), page_kind) not in successful_count_kinds:
+                    continue
+                try:
+                    hierarchy_future.notify_successful_page_kind(page_kind)
+                except Exception as e:
+                    hierarchy_uri = Hierarchy.uri_for(
+                        dimension_name=hierarchy_future.dimension_name,
+                        hierarchy_name=hierarchy_future.hierarchy.name,
+                    )
+                    future_errors.append(
+                        (
+                            (
+                                hierarchy_order[id(hierarchy_future)],
+                                page_kind_order[page_kind],
+                                2,
+                                0,
+                            ),
+                            workflow_error_from_exception(
+                                workflow="export",
+                                phase="content_hash",
+                                subject=hierarchy_uri,
+                                exception=e,
+                                severity="recoverable",
+                            ),
+                        )
+                    )
+
+        _errors.extend(
+            error for _, error in sorted(future_errors, key=lambda item: item[0])
+        )
+
+        if failed_hierarchy_ids:
+            for dimension_name, dimension in list(_dimensions.items()):
+                valid_hierarchies = [
+                    hierarchy
+                    for hierarchy in dimension.hierarchies
+                    if id(hierarchy) not in failed_hierarchy_ids
+                ]
+                if not valid_hierarchies:
+                    logger.info(
+                        "Discarding incomplete dimension '%s' after hierarchy export failure",
+                        dimension_name,
+                    )
+                    del _dimensions[dimension_name]
+                    continue
+                if len(valid_hierarchies) != len(dimension.hierarchies):
+                    dimension.hierarchies = valid_hierarchies
+                    dimension.defaultHierarchy = dimension._select_default_hierarchy(
+                        dimension_name=dimension.name,
+                        hierarchies=valid_hierarchies,
+                        default_hierarchy=dimension.defaultHierarchy,
+                    )
+
+    logger.info(
+        "Dimension export assembly finished total=%d kept=%d errors=%d",
+        len(all_dims),
+        len(_dimensions),
+        len(_errors),
+    )
     return _dimensions, _errors
 
 

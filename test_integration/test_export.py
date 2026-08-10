@@ -147,8 +147,7 @@ class TestExport:
             filter_rules=FilterRules(["Cubes('}*')", "Dimensions('}*')", "Processes('}*')"]),
             max_workers=DEFAULT_MAX_WORKERS,
         )
-        for category, category_errors in errors.items():
-            assert not category_errors, f"Found errors in {category}: {category_errors}"
+        assert not errors, f"Found errors: {errors}"
 
         assert all(not d.name.startswith("}") for d in model.dimensions)
         assert all(not c.name.startswith("}") for c in model.cubes)
@@ -166,8 +165,7 @@ class TestExport:
             ]),
             max_workers=DEFAULT_MAX_WORKERS,
         )
-        for category, category_errors in errors.items():
-            assert not category_errors, f"Found errors in {category}: {category_errors}"
+        assert not errors, f"Found errors: {errors}"
 
         dimension_names = [d.name for d in model.dimensions]
         cube_names = [c.name for c in model.cubes]
@@ -191,8 +189,7 @@ class TestExport:
             filter_rules=FilterRules(filter_rules),
             max_workers=DEFAULT_MAX_WORKERS,
         )
-        for category, category_errors in errors.items():
-            assert not category_errors, f"Found errors in {category}: {category_errors}"
+        assert not errors, f"Found errors: {errors}"
 
         dimension_names = [d.name for d in model.dimensions]
         cube_names = [c.name for c in model.cubes]
@@ -209,8 +206,7 @@ class TestExport:
             filter_rules=FilterRules([f"!Cubes('{forced_cube_name}')"]),
             max_workers=DEFAULT_MAX_WORKERS,
         )
-        for category, category_errors in errors.items():
-            assert not category_errors, f"Found errors in {category}: {category_errors}"
+        assert not errors, f"Found errors: {errors}"
 
         cube_names = [c.name for c in model.cubes]
         assert forced_cube_name in cube_names

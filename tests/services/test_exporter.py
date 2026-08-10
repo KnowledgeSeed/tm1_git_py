@@ -18,10 +18,10 @@ class TestExporter:
 
     def test_export_forwards_max_workers_to_dimensions(self):
         tm1_conn = mock.Mock()
-        with mock.patch.object(exporter_module, "dimensions_to_model", return_value=({}, {})) as mock_dims, \
-             mock.patch.object(exporter_module, "cubes_to_model", return_value=({}, {})), \
-             mock.patch.object(exporter_module, "procs_to_model", return_value=({}, {})), \
-             mock.patch.object(exporter_module, "chores_to_model", return_value=({}, {})):
+        with mock.patch.object(exporter_module, "dimensions_to_model", return_value=({}, [])) as mock_dims, \
+             mock.patch.object(exporter_module, "cubes_to_model", return_value=({}, [])), \
+             mock.patch.object(exporter_module, "procs_to_model", return_value=({}, [])), \
+             mock.patch.object(exporter_module, "chores_to_model", return_value=({}, [])):
             exporter_module.export(tm1_conn, model_id="unit-export", max_workers=9)
         worker_counts = mock_dims.call_args.kwargs.get("worker_counts")
         assert worker_counts is not None
@@ -191,7 +191,7 @@ class TestExporter:
             worker_counts=exporter_module.resolve_worker_counts(1),
         )
 
-        assert errors == {}
+        assert errors == []
         hierarchy = dimensions["Products"].hierarchies[0]
         assert hierarchy.elements_sort_type == "ByInput"
         assert hierarchy.elements_sort_sense == "Descending"
@@ -241,12 +241,139 @@ class TestExporter:
             worker_counts=exporter_module.resolve_worker_counts(1),
         )
 
-        assert errors == {}
+        assert errors == []
         hierarchy = dimensions["Products"].hierarchies[0]
         assert hierarchy.elements.sort_metadata() == {
             "ElementsSortType": "ByHierarchy",
             "ComponentsSortType": "ByName",
         }
+
+    def test_hierarchy_completion_callbacks_are_deferred_to_the_coordinator(self):
+        from concurrent.futures import Future
+
+        hierarchy_future = exporter_module.HierarchyFuture(
+            dimension_name="Products",
+            hierarchy=mock.Mock(),
+        )
+        page_future = Future()
+        completed = []
+        hierarchy_future.add_page(
+            "elements",
+            skip=0,
+            top=100_000,
+            future=page_future,
+        )
+        hierarchy_future.add_elements_done_callback(completed.append)
+
+        page_future.set_result(None)
+
+        assert completed == []
+        hierarchy_future.notify_successful_page_kind("elements")
+        assert completed == [hierarchy_future]
+
+    def test_dimensions_discards_hierarchy_after_page_failure_and_skips_finalization(
+        self, monkeypatch
+    ):
+        import uuid
+
+        class FakeContentHashCalculator:
+            def __init__(self, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+        model_id = f"export_failed_page_{uuid.uuid4().hex}"
+        hierarchy_identity = types.SimpleNamespace(
+            name="Products",
+            etag=None,
+            cardinality=1,
+        )
+        monkeypatch.setattr(exporter_module, "ContentHashCalculator", FakeContentHashCalculator)
+        monkeypatch.setattr(exporter_module, "get_dimension_names", lambda *args, **kwargs: ["Products"])
+        monkeypatch.setattr(exporter_module, "get_hierarchy_names", lambda *args, **kwargs: [hierarchy_identity])
+        monkeypatch.setattr(exporter_module, "get_hierarchy_sort_metadata", lambda *args, **kwargs: {})
+        monkeypatch.setattr(exporter_module, "get_elements_count", lambda *args, **kwargs: 1)
+        monkeypatch.setattr(exporter_module, "get_edges_count", lambda *args, **kwargs: 0)
+        monkeypatch.setattr(exporter_module, "get_subsets_count", lambda *args, **kwargs: 0)
+
+        def fail_page(*args, **kwargs):
+            raise RuntimeError("elements page unavailable")
+
+        monkeypatch.setattr(exporter_module, "_get_elements_page", fail_page)
+        with mock.patch.object(
+            exporter_module.Hierarchy,
+            "persist_elements_etag",
+        ) as persist_elements_etag:
+            dimensions, errors = exporter_module.dimensions_to_model(
+                mock.Mock(),
+                model_id=model_id,
+                filter_rules=FilterRules([]),
+                progress_sink=exporter_module.NoopProgressSink(),
+                worker_counts=exporter_module.resolve_worker_counts(1),
+            )
+
+            assert dimensions == {}
+            assert [(error.phase, error.subject) for error in errors] == [
+                (
+                    "hierarchy_page",
+                    "Dimensions('Products')/Hierarchies('Products')?$skip=0&$top=100000",
+                )
+            ]
+            persist_elements_etag.assert_not_called()
+
+    def test_dimensions_orders_count_future_errors_by_hierarchy_work_item(self, monkeypatch):
+        import uuid
+
+        class FakeContentHashCalculator:
+            def __init__(self, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+        model_id = f"export_failed_counts_{uuid.uuid4().hex}"
+        hierarchy_identity = types.SimpleNamespace(
+            name="Products",
+            etag=None,
+            cardinality=0,
+        )
+        monkeypatch.setattr(exporter_module, "ContentHashCalculator", FakeContentHashCalculator)
+        monkeypatch.setattr(exporter_module, "get_dimension_names", lambda *args, **kwargs: ["Products"])
+        monkeypatch.setattr(exporter_module, "get_hierarchy_names", lambda *args, **kwargs: [hierarchy_identity])
+        monkeypatch.setattr(exporter_module, "get_hierarchy_sort_metadata", lambda *args, **kwargs: {})
+
+        def failing_count(label):
+            def _count(*args, **kwargs):
+                raise RuntimeError(f"{label} count unavailable")
+
+            return _count
+
+        monkeypatch.setattr(exporter_module, "get_elements_count", failing_count("elements"))
+        monkeypatch.setattr(exporter_module, "get_edges_count", failing_count("edges"))
+        monkeypatch.setattr(exporter_module, "get_subsets_count", failing_count("subsets"))
+
+        dimensions, errors = exporter_module.dimensions_to_model(
+            mock.Mock(),
+            model_id=model_id,
+            filter_rules=FilterRules([]),
+            progress_sink=exporter_module.NoopProgressSink(),
+            worker_counts=exporter_module.resolve_worker_counts(4),
+        )
+
+        assert dimensions == {}
+        assert [error.message for error in errors] == [
+            "elements count unavailable",
+            "edges count unavailable",
+            "subsets count unavailable",
+        ]
+        assert all(error.phase == "hierarchy_count" for error in errors)
 
     def test_dimensions_to_model_reuse_includes_cached_edge_cardinality(self, monkeypatch):
         import uuid
@@ -298,7 +425,7 @@ class TestExporter:
             progress_sink=exporter_module.NoopProgressSink(),
             worker_counts=exporter_module.resolve_worker_counts(1),
         )
-        assert first_errors == {}
+        assert first_errors == []
         first_hierarchy = first_dimensions["Products"].hierarchies[0]
         assert first_hierarchy.edges.cardinality() == 1
 
@@ -310,7 +437,7 @@ class TestExporter:
             worker_counts=exporter_module.resolve_worker_counts(1),
         )
 
-        assert second_errors == {}
+        assert second_errors == []
         assert calls == {"elements_page": 1, "edges_page": 1}
         second_hierarchy = second_dimensions["Products"].hierarchies[0]
         assert len(second_hierarchy.elements) == 2
@@ -470,7 +597,7 @@ class TestExporter:
         )
         tm1_conn.processes.get_all_names.assert_not_called()
         assert "MyProcess" in processes
-        assert errors == {}
+        assert errors == []
 
     def test_procs_to_model_reads_datasource_ui_data_and_variables_ui_data_from_process_body(self, mocker):
         from tm1_git_py.services.exporter import procs_to_model
@@ -508,7 +635,7 @@ class TestExporter:
             filter_rules=FilterRules([]),
         )
 
-        assert errors == {}
+        assert errors == []
         process_obj = processes["ProcWithBody"]
         assert process_obj.datasource == {
             "Type": "ASCII",
@@ -621,14 +748,14 @@ class TestExporter:
             return_value=[],
         )
 
-        cubes, errors = cubes_to_model(
+        cubes, errors = exporter_module.cubes_to_model(
             tm1_conn,
             _dimensions={},
             filter_rules=FilterRules(["Cubes('Sales*')"]),
         )
 
         assert cubes == {}
-        assert errors == {}
+        assert errors == []
         _, kwargs = mock_get_cube_names.call_args
         assert kwargs["filter"] is not None
         tm1_conn.cubes.get_all_names.assert_not_called()
@@ -796,7 +923,7 @@ class TestExporter:
             ]),
         )
 
-        assert errors == {}
+        assert errors == []
         cube = cubes["Organization Units Settings"]
         assert cube.dimensions == ["Versions", "Organization Units"]
 
@@ -835,7 +962,7 @@ class TestExporter:
             filter_rules=FilterRules([]),
         )
 
-        assert errors == {}
+        assert errors == []
         cube = cubes["Sales"]
         assert cube.get_rule_text() == "[] = N: 1;"
         assert cube.get_drillthrough_rule_text() == "[]=s:'simple_drillthrough';"
@@ -863,7 +990,7 @@ class TestExporter:
             filter_rules=FilterRules([]),
         )
 
-        assert errors == {}
+        assert errors == []
         cube = cubes["Sales"]
         assert cube.drillthrough_rules == []
         assert "DrillthroughRules@Code.link" not in json.loads(cube.as_json())
@@ -894,32 +1021,217 @@ class TestExporter:
             filter_rules=FilterRules(["Cubes('Sales')/DrillthroughRules('default')"]),
         )
 
-        assert errors == {}
+        assert errors == []
         assert cubes["Sales"].drillthrough_rules == []
 
     def test_export_no_filter_rules_disables_skip_control_flags(self, mocker):
         tm1_service = mocker.Mock()
-        mock_dimensions = mocker.patch("tm1_git_py.services.exporter.dimensions_to_model", return_value=({}, {}))
-        mock_cubes = mocker.patch("tm1_git_py.services.exporter.cubes_to_model", return_value=({}, {}))
-        mock_processes = mocker.patch("tm1_git_py.services.exporter.procs_to_model", return_value=({}, {}))
-        mock_chores = mocker.patch("tm1_git_py.services.exporter.chores_to_model", return_value=({}, {}))
+        mock_dimensions = mocker.patch("tm1_git_py.services.exporter.dimensions_to_model", return_value=({}, []))
+        mock_cubes = mocker.patch("tm1_git_py.services.exporter.cubes_to_model", return_value=({}, []))
+        mock_processes = mocker.patch("tm1_git_py.services.exporter.procs_to_model", return_value=({}, []))
+        mock_chores = mocker.patch("tm1_git_py.services.exporter.chores_to_model", return_value=({}, []))
 
         model, errors = export(tm1_service, model_id="unit-export", filter_rules=None)
 
         assert isinstance(model, Model)
-        assert errors == {"dim": {}, "cube": {}, "process": {}, "chore": {}}
+        assert errors == []
         mock_dimensions.assert_called_once()
         args, kwargs = mock_dimensions.call_args
         expected_pf = apply_default_filter_rules(None)
         assert kwargs["filter_rules"]._normalized_rules == expected_pf._normalized_rules
 
+    def test_export_returns_collected_errors_notifies_callback_and_logs_once(self, mocker, caplog):
+        error = exporter_module.WorkflowError(
+            workflow="export",
+            phase="cubes",
+            subject="Cubes('Sales')",
+            exception_type="RuntimeError",
+            message="Cube unavailable",
+            severity="recoverable",
+        )
+        mocker.patch(
+            "tm1_git_py.services.exporter.dimensions_to_model",
+            return_value=({}, []),
+        )
+        mocker.patch(
+            "tm1_git_py.services.exporter.cubes_to_model",
+            return_value=({}, [error]),
+        )
+        mocker.patch(
+            "tm1_git_py.services.exporter.procs_to_model",
+            return_value=({}, []),
+        )
+        mocker.patch(
+            "tm1_git_py.services.exporter.chores_to_model",
+            return_value=({}, []),
+        )
+        received = []
+
+        with caplog.at_level(exporter_module.logging.INFO, logger=exporter_module.__name__):
+            model, errors = export(
+                mocker.Mock(),
+                model_id="unit-export",
+                error_callback=received.append,
+            )
+
+        assert isinstance(model, Model)
+        assert errors == [error]
+        assert received == [error]
+        error_logs = [
+            record for record in caplog.records
+            if record.name == exporter_module.__name__
+            and record.getMessage().startswith("TM1 export error ")
+        ]
+        assert len(error_logs) == 1
+
+    def test_export_returns_partial_model_after_fatal_phase_failure(self, mocker):
+        mocker.patch(
+            "tm1_git_py.services.exporter.dimensions_to_model",
+            side_effect=RuntimeError("model store unavailable"),
+        )
+        mocker.patch(
+            "tm1_git_py.services.exporter.cubes_to_model",
+            return_value=({}, []),
+        )
+        mocker.patch(
+            "tm1_git_py.services.exporter.procs_to_model",
+            return_value=({}, []),
+        )
+        mocker.patch(
+            "tm1_git_py.services.exporter.chores_to_model",
+            return_value=({}, []),
+        )
+
+        model, errors = export(mocker.Mock(), model_id="unit-export")
+
+        assert isinstance(model, Model)
+        assert model.dimensions == []
+        assert len(errors) == 1
+        assert errors[0].phase == "dimensions"
+        assert errors[0].severity == "fatal"
+
+    def test_export_logs_info_lifecycle_milestones(self, mocker, caplog):
+        mocker.patch(
+            "tm1_git_py.services.exporter.dimensions_to_model",
+            return_value=({}, []),
+        )
+        mocker.patch(
+            "tm1_git_py.services.exporter.cubes_to_model",
+            return_value=({}, []),
+        )
+        mocker.patch(
+            "tm1_git_py.services.exporter.procs_to_model",
+            return_value=({}, []),
+        )
+        mocker.patch(
+            "tm1_git_py.services.exporter.chores_to_model",
+            return_value=({}, []),
+        )
+
+        with caplog.at_level(exporter_module.logging.INFO, logger=exporter_module.__name__):
+            export(mocker.Mock(), model_id="unit-export", max_workers=1)
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == exporter_module.__name__
+        ]
+        assert any(message.startswith("Starting TM1 export ") for message in messages)
+        assert any(message.startswith("TM1 export model assembled ") for message in messages)
+        assert "TM1 export completed without errors" in messages
+
+    def test_export_preserves_interrupt_and_closes_progress_manager(self, mocker):
+        managers = []
+
+        class FakeProgressManager:
+            def __init__(self, sink):
+                self.sink = sink
+                self.started = False
+                self.closed = False
+                managers.append(self)
+
+            def start(self):
+                self.started = True
+
+            def get_multi_process_progress_queue_sink(self):
+                return mocker.Mock()
+
+            def close(self):
+                self.closed = True
+
+        progress_sink = mocker.Mock()
+        progress_sink.on_event.side_effect = KeyboardInterrupt
+        mocker.patch(
+            "tm1_git_py.services.exporter.MultiProcessProgressManager",
+            FakeProgressManager,
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            export(
+                mocker.Mock(),
+                model_id="unit-export",
+                progress_sink=progress_sink,
+                max_workers=8,
+            )
+
+        assert len(managers) == 1
+        assert managers[0].started is True
+        assert managers[0].closed is True
+
+    def test_process_body_parse_failure_preserves_process_and_returns_diagnostic(self, mocker):
+        tm1_conn = mocker.Mock()
+        mocker.patch(
+            "tm1_git_py.services.exporter.get_process_names",
+            return_value=["ProcWithInvalidBody"],
+        )
+        tm1_conn.processes.get.return_value = types.SimpleNamespace(
+            name="ProcWithInvalidBody",
+            has_security_access=False,
+            parameters=[],
+            variables=[],
+            prolog_procedure="",
+            metadata_procedure="",
+            data_procedure="",
+            epilog_procedure="",
+            body="{invalid json",
+        )
+
+        processes, errors = exporter_module.procs_to_model(
+            tm1_conn,
+            filter_rules=FilterRules([]),
+        )
+
+        assert "ProcWithInvalidBody" in processes
+        assert [(error.phase, error.subject, error.severity) for error in errors] == [
+            ("process_body", "Processes('ProcWithInvalidBody')", "recoverable"),
+        ]
+
+    def test_cubes_to_model_returns_structured_error_for_failed_cube(self, mocker):
+        tm1_conn = mocker.Mock()
+        mocker.patch("tm1_git_py.services.exporter.get_cube_names", return_value=["Sales"])
+        tm1_conn.cubes.get.side_effect = RuntimeError("Cube unavailable")
+
+        cubes, errors = exporter_module.cubes_to_model(
+            tm1_conn,
+            _dimensions={},
+            filter_rules=FilterRules([]),
+        )
+
+        assert cubes == {}
+        assert len(errors) == 1
+        assert errors[0].workflow == "export"
+        assert errors[0].phase == "cubes"
+        assert errors[0].subject == "Cubes('Sales')"
+        assert errors[0].exception_type == "RuntimeError"
+        assert errors[0].severity == "recoverable"
+
     def test_export_non_technical_filter_rules_keep_skip_control_disabled(self, mocker):
         tm1_service = mocker.Mock()
         filter_rules = ["Processes('MyProcess*')"]
-        mock_dimensions = mocker.patch("tm1_git_py.services.exporter.dimensions_to_model", return_value=({}, {}))
-        mock_cubes = mocker.patch("tm1_git_py.services.exporter.cubes_to_model", return_value=({}, {}))
-        mock_processes = mocker.patch("tm1_git_py.services.exporter.procs_to_model", return_value=({}, {}))
-        mocker.patch("tm1_git_py.services.exporter.chores_to_model", return_value=({}, {}))
+        mock_dimensions = mocker.patch("tm1_git_py.services.exporter.dimensions_to_model", return_value=({}, []))
+        mock_cubes = mocker.patch("tm1_git_py.services.exporter.cubes_to_model", return_value=({}, []))
+        mock_processes = mocker.patch("tm1_git_py.services.exporter.procs_to_model", return_value=({}, []))
+        mocker.patch("tm1_git_py.services.exporter.chores_to_model", return_value=({}, []))
 
         export(tm1_service, model_id="unit-export", filter_rules=FilterRules(filter_rules))
 
@@ -937,10 +1249,10 @@ class TestExporter:
     def test_export_technical_intent_filter_rules_enable_skip_control_flags(self, mocker):
         tm1_service = mocker.Mock()
         filter_rules = ["Dimensions('}*')", "Cubes('}*')", "Processes('}*')"]
-        mock_dimensions = mocker.patch("tm1_git_py.services.exporter.dimensions_to_model", return_value=({}, {}))
-        mock_cubes = mocker.patch("tm1_git_py.services.exporter.cubes_to_model", return_value=({}, {}))
-        mock_processes = mocker.patch("tm1_git_py.services.exporter.procs_to_model", return_value=({}, {}))
-        mocker.patch("tm1_git_py.services.exporter.chores_to_model", return_value=({}, {}))
+        mock_dimensions = mocker.patch("tm1_git_py.services.exporter.dimensions_to_model", return_value=({}, []))
+        mock_cubes = mocker.patch("tm1_git_py.services.exporter.cubes_to_model", return_value=({}, []))
+        mock_processes = mocker.patch("tm1_git_py.services.exporter.procs_to_model", return_value=({}, []))
+        mocker.patch("tm1_git_py.services.exporter.chores_to_model", return_value=({}, []))
 
         export(tm1_service, model_id="unit-export", filter_rules=FilterRules(filter_rules))
 
@@ -958,10 +1270,10 @@ class TestExporter:
     def test_export_custom_filter_rules_are_forwarded_as_is(self, mocker):
         tm1_service = mocker.Mock()
         filter_rules = ["Dimensions('TestDim1*')", "Cubes('TestCube1*')"]
-        mock_dimensions = mocker.patch("tm1_git_py.services.exporter.dimensions_to_model", return_value=({}, {}))
-        mock_cubes = mocker.patch("tm1_git_py.services.exporter.cubes_to_model", return_value=({}, {}))
-        mock_processes = mocker.patch("tm1_git_py.services.exporter.procs_to_model", return_value=({}, {}))
-        mocker.patch("tm1_git_py.services.exporter.chores_to_model", return_value=({}, {}))
+        mock_dimensions = mocker.patch("tm1_git_py.services.exporter.dimensions_to_model", return_value=({}, []))
+        mock_cubes = mocker.patch("tm1_git_py.services.exporter.cubes_to_model", return_value=({}, []))
+        mock_processes = mocker.patch("tm1_git_py.services.exporter.procs_to_model", return_value=({}, []))
+        mocker.patch("tm1_git_py.services.exporter.chores_to_model", return_value=({}, []))
 
         export(tm1_service, model_id="unit-export", filter_rules=FilterRules(filter_rules))
 
@@ -980,10 +1292,10 @@ class TestExporter:
     def test_export_shorthand_filter_rules_are_forwarded_canonically(self, mocker):
         tm1_service = mocker.Mock()
         filter_rules = ["Cubes/Views", "Dimensions/Hierarchies/Subsets('}*')"]
-        mock_dimensions = mocker.patch("tm1_git_py.services.exporter.dimensions_to_model", return_value=({}, {}))
-        mock_cubes = mocker.patch("tm1_git_py.services.exporter.cubes_to_model", return_value=({}, {}))
-        mock_processes = mocker.patch("tm1_git_py.services.exporter.procs_to_model", return_value=({}, {}))
-        mocker.patch("tm1_git_py.services.exporter.chores_to_model", return_value=({}, {}))
+        mock_dimensions = mocker.patch("tm1_git_py.services.exporter.dimensions_to_model", return_value=({}, []))
+        mock_cubes = mocker.patch("tm1_git_py.services.exporter.cubes_to_model", return_value=({}, []))
+        mock_processes = mocker.patch("tm1_git_py.services.exporter.procs_to_model", return_value=({}, []))
+        mocker.patch("tm1_git_py.services.exporter.chores_to_model", return_value=({}, []))
 
         export(tm1_service, model_id="unit-export", filter_rules=FilterRules(filter_rules))
 
@@ -1001,11 +1313,11 @@ class TestExporter:
         filter_rules = ["!Dimensions('*')/Hierarchies('Leaves')"]
         mock_dimensions = mocker.patch(
             "tm1_git_py.services.exporter.dimensions_to_model",
-            return_value=({}, {}),
+            return_value=({}, []),
         )
-        mocker.patch("tm1_git_py.services.exporter.cubes_to_model", return_value=({}, {}))
-        mocker.patch("tm1_git_py.services.exporter.procs_to_model", return_value=({}, {}))
-        mocker.patch("tm1_git_py.services.exporter.chores_to_model", return_value=({}, {}))
+        mocker.patch("tm1_git_py.services.exporter.cubes_to_model", return_value=({}, []))
+        mocker.patch("tm1_git_py.services.exporter.procs_to_model", return_value=({}, []))
+        mocker.patch("tm1_git_py.services.exporter.chores_to_model", return_value=({}, []))
 
         export(tm1_service, model_id="unit-export", filter_rules=FilterRules(filter_rules))
 

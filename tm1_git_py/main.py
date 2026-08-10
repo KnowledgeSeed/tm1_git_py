@@ -279,11 +279,8 @@ def _cmd_export(args: argparse.Namespace) -> None:
     )
     tqdm_sink.reset_bars()
 
-    if export_errors and any(export_errors.values()):
-        logger.warning("Export errors encountered")
-        for error_type, errors in export_errors.items():
-            if errors:
-                logger.warning("Export error category=%s details=%s", error_type, errors)
+    if export_errors:
+        logger.warning("Export errors encountered total=%d", len(export_errors))
     else:
         logger.info("Export completed successfully with no errors")
 
