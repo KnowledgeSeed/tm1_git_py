@@ -1,5 +1,6 @@
 import concurrent
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 import logging
 import os
 import re
@@ -37,6 +38,12 @@ from tm1_git_py.reporting.progress_reporting import (
     ProgressSink,
     ProgressUnit,
 )
+from tm1_git_py.reporting.error_reporting import (
+    ErrorCallback,
+    WorkflowError,
+    collect_worker_errors,
+    workflow_error_from_exception,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -48,6 +55,17 @@ _HIERARCHY_SORT_JSON_FIELDS = {
     "ComponentsSortType",
     "ComponentsSortSense",
 }
+
+
+@dataclass(frozen=True)
+class HierarchyFutureMetadata:
+    """Coordinator-side context for one submitted hierarchy parse."""
+
+    submission_index: int
+    dimension_name: str
+    hierarchy_name: str
+    hierarchy_json_path: str
+    future: Future
 
 
 def _json_load_text(raw: str) -> Any:
@@ -398,25 +416,11 @@ def _ensure_hierarchy_store_groups(
         source_has_elements = _hierarchy_array_has_items(hierarchy_json_path, "Elements")
         cached_has_elements = len(elements) > 0
         if source_has_elements != cached_has_elements:
-            logger.info(
-                "Rebuilding stale cached elements for %s/%s: source_has_elements=%s cached_has_elements=%s",
-                dimension_name,
-                hierarchy_name,
-                source_has_elements,
-                cached_has_elements,
-            )
             needs_elements_rebuild = True
     if not needs_edges_rebuild:
         source_has_edges = _hierarchy_array_has_items(hierarchy_json_path, "Edges")
         cached_has_edges = len(edges) > 0
         if source_has_edges != cached_has_edges:
-            logger.info(
-                "Rebuilding stale cached edges for %s/%s: source_has_edges=%s cached_has_edges=%s",
-                dimension_name,
-                hierarchy_name,
-                source_has_edges,
-                cached_has_edges,
-            )
             needs_edges_rebuild = True
     if needs_elements_rebuild and needs_edges_rebuild:
         elements_progress_range = (0.0, 0.5)
@@ -538,8 +542,9 @@ def deserialize_model(
     *,
     progress_sink: Optional[ProgressSink] = None,
     max_workers: Optional[int] = None,
+    error_callback: Optional[ErrorCallback] = None,
     _resolved_cpu_workers: Optional[int] = None,
-) -> tuple[Model, dict[str, str]]:
+) -> tuple[Model, list[WorkflowError]]:
 
     dir = _handle_long_path(dir)
     resolved_model_id = (model_id or Path(dir).resolve().name).strip()
@@ -549,82 +554,262 @@ def deserialize_model(
     progress_sink = progress_sink if progress_sink is not None else NoopProgressSink()
     worker_counts = resolve_worker_counts(max_workers=max_workers, io_ratio=1)
     multi_process_progress_manager: Optional[MultiProcessProgressManager] = None
-    if (worker_counts.cpu_workers > 1 and not isinstance(progress_sink, NoopProgressSink) and not isinstance(progress_sink, MultiProcessProgressQueueSink)):
-        multi_process_progress_manager = MultiProcessProgressManager(progress_sink)
-        multi_process_progress_manager.start()
-        active_progress_sink = multi_process_progress_manager.get_multi_process_progress_queue_sink()
-    else:
-        active_progress_sink = progress_sink
-
+    progress_manager_started = False
     dimensions_dir = dir + '/dimensions'
     cubes_dir = dir + '/cubes'
     processes_dir = dir + '/processes'
     chores_dir = dir + '/chores'
-
-    active_progress_sink.on_event(ProgressEvent.total_line(message="Deserializing", total_delta=max(1, _directory_total_bytes(dir)), unit=ProgressUnit.BYTE))
-
     total_object_count = 0
+    active_progress_sink = progress_sink
+    _setup_errors: list[WorkflowError] = []
+    _processes: Dict[str, Process] = {}
+    _chores: Dict[str, Chore] = {}
+    _dimensions: Dict[str, Dimension] = {}
+    _cubes: Dict[str, Cube] = {}
+    _process_errors: list[WorkflowError] = []
+    _chore_errors: list[WorkflowError] = []
+    _dim_errors: list[WorkflowError] = []
+    _cube_errors: list[WorkflowError] = []
+
+    logger.info(
+        "Starting model deserialization path=%s model_id=%s max_workers=%s",
+        dir,
+        resolved_model_id,
+        worker_counts.max_workers,
+    )
     
     def _add_object_count(delta: int) -> None:
         nonlocal total_object_count
         if delta > 0:
             total_object_count += int(delta)
 
-    model_store = ModelStore.for_model_id(resolved_model_id)
     try:
-
-        with ThreadPoolExecutor(max_workers=worker_counts.io_workers) as thread_pool_executor:
-            with ContentHashCalculator(db_path=model_store.db_path, max_workers=worker_counts.cpu_workers, progress_sink=active_progress_sink) as content_hash_calculator:
-        
-                _processes, _process_errors = deserialize_processes(
-                    processes_dir,
-                    progress=active_progress_sink,
-                    count_callback=_add_object_count,
+        if (
+            worker_counts.cpu_workers > 1
+            and not isinstance(progress_sink, NoopProgressSink)
+            and not isinstance(progress_sink, MultiProcessProgressQueueSink)
+        ):
+            try:
+                multi_process_progress_manager = MultiProcessProgressManager(progress_sink)
+                multi_process_progress_manager.start()
+                progress_manager_started = True
+                active_progress_sink = (
+                    multi_process_progress_manager.get_multi_process_progress_queue_sink()
+                )
+            except Exception as exc:
+                _setup_errors.append(
+                    workflow_error_from_exception(
+                        workflow="deserialize",
+                        phase="progress_setup",
+                        subject=dir,
+                        exception=exc,
+                        severity="fatal",
+                    )
                 )
 
-                _chores, _chore_errors = deserialize_chores(
-                    chores_dir,
-                    progress=active_progress_sink,
-                    count_callback=_add_object_count,
+        try:
+            active_progress_sink.on_event(
+                ProgressEvent.total_line(
+                    message="Deserializing",
+                    total_delta=max(1, _directory_total_bytes(dir)),
+                    unit=ProgressUnit.BYTE,
                 )
+            )
+        except Exception as exc:
+            _setup_errors.append(
+                workflow_error_from_exception(
+                    workflow="deserialize",
+                    phase="progress",
+                    subject=dir,
+                    exception=exc,
+                    severity="fatal",
+                )
+            )
 
-                _dimensions, _dim_errors = deserialize_dimensions(
-                    dimensions_dir,
-                    resolved_model_id,
-                    progress=active_progress_sink,
-                    count_callback=_add_object_count,
-                    thread_pool_executor=thread_pool_executor,
-                    content_hash_calculator=content_hash_calculator,
+        try:
+            _processes, _process_errors = deserialize_processes(
+                processes_dir,
+                progress=active_progress_sink,
+                count_callback=_add_object_count,
+            )
+        except Exception as exc:
+            _process_errors.append(
+                workflow_error_from_exception(
+                    workflow="deserialize",
+                    phase="processes",
+                    subject=processes_dir,
+                    exception=exc,
+                    severity="fatal",
                 )
+            )
+        logger.info(
+            "Process deserialization finished kept=%d errors=%d",
+            len(_processes),
+            len(_process_errors),
+        )
 
-                _cubes, _cube_errors = deserialize_cubes(
-                    cubes_dir,
-                    _dimensions,
-                    progress=active_progress_sink,
-                    count_callback=_add_object_count,
+        try:
+            _chores, _chore_errors = deserialize_chores(
+                chores_dir,
+                progress=active_progress_sink,
+                count_callback=_add_object_count,
+            )
+        except Exception as exc:
+            _chore_errors.append(
+                workflow_error_from_exception(
+                    workflow="deserialize",
+                    phase="chores",
+                    subject=chores_dir,
+                    exception=exc,
+                    severity="fatal",
                 )
+            )
+        logger.info(
+            "Chore deserialization finished kept=%d errors=%d",
+            len(_chores),
+            len(_chore_errors),
+        )
+
+        try:
+            model_store = ModelStore.for_model_id(resolved_model_id)
+            with ThreadPoolExecutor(
+                max_workers=max(1, worker_counts.io_workers)
+            ) as thread_pool_executor, ContentHashCalculator(
+                db_path=model_store.db_path,
+                max_workers=worker_counts.cpu_workers,
+                progress_sink=active_progress_sink,
+            ) as content_hash_calculator:
+                try:
+                    _dimensions, _dim_errors = deserialize_dimensions(
+                        dimensions_dir,
+                        resolved_model_id,
+                        progress=active_progress_sink,
+                        count_callback=_add_object_count,
+                        thread_pool_executor=thread_pool_executor,
+                        content_hash_calculator=content_hash_calculator,
+                    )
+                except Exception as exc:
+                    _dim_errors.append(
+                        workflow_error_from_exception(
+                            workflow="deserialize",
+                            phase="dimensions",
+                            subject=dimensions_dir,
+                            exception=exc,
+                            severity="fatal",
+                        )
+                    )
+        except Exception as exc:
+            _dim_errors.append(
+                workflow_error_from_exception(
+                    workflow="deserialize",
+                    phase="dimensions_setup",
+                    subject=dimensions_dir,
+                    exception=exc,
+                    severity="fatal",
+                )
+            )
+        logger.info(
+            "Dimension deserialization finished kept=%d errors=%d",
+            len(_dimensions),
+            len(_dim_errors),
+        )
+
+        try:
+            _cubes, _cube_errors = deserialize_cubes(
+                cubes_dir,
+                _dimensions,
+                progress=active_progress_sink,
+                count_callback=_add_object_count,
+            )
+        except Exception as exc:
+            _cube_errors.append(
+                workflow_error_from_exception(
+                    workflow="deserialize",
+                    phase="cubes",
+                    subject=cubes_dir,
+                    exception=exc,
+                    severity="fatal",
+                )
+            )
+        logger.info(
+            "Cube deserialization finished kept=%d errors=%d",
+            len(_cubes),
+            len(_cube_errors),
+        )
     finally:
-        if multi_process_progress_manager is not None:
+        if multi_process_progress_manager is not None and progress_manager_started:
             multi_process_progress_manager.close()
-        
-        # active_progress_sink.close()
 
-    _model = Model(cubes=list(_cubes.values()),
-                   dimensions=list(_dimensions.values()),
-                   processes=list(_processes.values()),
-                   chores=list(_chores.values()),
-                   model_id=resolved_model_id,
-                   total_object_count=total_object_count)
-    _errors = _dim_errors | _cube_errors | _process_errors | _chore_errors
-    logger.debug(
-        "Deserialized model from '%s' (dimensions=%d cubes=%d processes=%d chores=%d errors=%d)",
+    _assembly_errors: list[WorkflowError] = []
+    try:
+        _model = Model(
+            cubes=list(_cubes.values()),
+            dimensions=list(_dimensions.values()),
+            processes=list(_processes.values()),
+            chores=list(_chores.values()),
+            model_id=resolved_model_id,
+            total_object_count=total_object_count,
+        )
+    except Exception as exc:
+        _assembly_errors.append(
+            workflow_error_from_exception(
+                workflow="deserialize",
+                phase="model_assembly",
+                subject=dir,
+                exception=exc,
+                severity="fatal",
+            )
+        )
+        _model = Model(
+            cubes=[],
+            dimensions=[],
+            processes=[],
+            chores=[],
+            model_id=resolved_model_id,
+            total_object_count=0,
+        )
+    _errors: list[WorkflowError] = []
+    for helper_errors in (
+        _setup_errors,
+        _process_errors,
+        _chore_errors,
+        _dim_errors,
+        _cube_errors,
+        _assembly_errors,
+    ):
+        collect_worker_errors(
+            _errors,
+            helper_errors,
+            error_callback=error_callback,
+        )
+    logger.info(
+        "Deserialized model path=%s dimensions=%d cubes=%d processes=%d chores=%d",
         dir,
         len(_dimensions),
         len(_cubes),
         len(_processes),
         len(_chores),
-        len(_errors),
     )
+    if _errors:
+        recoverable_errors = sum(error.severity == "recoverable" for error in _errors)
+        for error in _errors:
+            logger.log(
+                logging.ERROR if error.severity == "fatal" else logging.WARNING,
+                "Model deserialization error workflow=%s phase=%s subject=%s type=%s message=%s",
+                error.workflow,
+                error.phase,
+                error.subject,
+                error.exception_type,
+                error.message,
+            )
+        logger.warning(
+            "Model deserialization completed with errors total=%d recoverable=%d fatal=%d",
+            len(_errors),
+            recoverable_errors,
+            len(_errors) - recoverable_errors,
+        )
+    else:
+        logger.info("Model deserialization completed without errors")
     return _model, _errors
 
 
@@ -633,11 +818,10 @@ def deserialize_chores(
     *,
     progress: Optional[ProgressSink] = None,
     count_callback: Optional[Callable[[int], None]] = None,
-) -> tuple[Dict[str, Chore], Dict[str, str]]:
+) -> tuple[Dict[str, Chore], list[WorkflowError]]:
     progress = progress if progress is not None else NoopProgressSink()
     chores: Dict[str, Chore] = {}
-    chores_errors: Dict[str, str] = {}
-    logger.debug("Deserializing chores from '%s'", chore_dir)
+    chores_errors: list[WorkflowError] = []
     if not os.path.exists(chore_dir):
         return chores, chores_errors
 
@@ -645,6 +829,16 @@ def deserialize_chores(
         file_path = os.path.join(chore_dir, file_name)
         _progress_start(progress, file_path, "reading chore")
         if not file_name.endswith('.json'):
+            chores_errors.append(
+                WorkflowError(
+                    workflow="deserialize",
+                    phase="chore_artifact",
+                    subject=file_path,
+                    exception_type="UnsupportedArtifact",
+                    message="not a chore json file",
+                    severity="recoverable",
+                )
+            )
             _progress_mark(progress, file_path)
             continue
         file_name_base, _, _ = file_name.rpartition('.')
@@ -666,9 +860,15 @@ def deserialize_chores(
             if count_callback is not None:
                 count_callback(1)
         except Exception as e:
-            chores_link = Chore.uri_for(file_name_base)
-            chores_errors[chores_link] = str(e)
-            logger.warning("Failed to deserialize chore '%s': %s", file_name, e, exc_info=True)
+            chores_errors.append(
+                workflow_error_from_exception(
+                    workflow="deserialize",
+                    phase="chore",
+                    subject=file_path,
+                    exception=e,
+                    severity="recoverable",
+                )
+            )
             _progress_mark(progress, file_path)
     return chores, chores_errors
 
@@ -678,21 +878,27 @@ def deserialize_processes(
     *,
     progress: Optional[ProgressSink] = None,
     count_callback: Optional[Callable[[int], None]] = None,
-) -> tuple[Dict[str, Process], Dict[str, str]]:
+) -> tuple[Dict[str, Process], list[WorkflowError]]:
     progress = progress if progress is not None else NoopProgressSink()
     processes: Dict[str, Process] = {}
-    process_errors: Dict[str, str] = {}
-    logger.debug("Deserializing processes from '%s'", process_dir)
-
+    process_errors: list[WorkflowError] = []
     files = directory_to_dict(process_dir)
     for file_name in list(files.keys()):
 
         file_name_base, dot, file_name_ext = file_name.rpartition('.')
-        process_link = Process.uri_for(file_name_base)
+        process_file_path = os.path.join(process_dir, file_name)
 
         if file_name_ext != 'json' and file_name_ext != 'ti':
-            process_errors[process_link] = 'not a process json or ti file'
-            logger.warning("Skipping non-process artifact: '%s'", file_name)
+            process_errors.append(
+                WorkflowError(
+                    workflow="deserialize",
+                    phase="process_artifact",
+                    subject=process_file_path,
+                    exception_type="UnsupportedArtifact",
+                    message="not a process json or ti file",
+                    severity="recoverable",
+                )
+            )
             _progress_mark(progress, os.path.join(process_dir, file_name))
             continue
         if file_name_ext != 'json':
@@ -702,7 +908,6 @@ def deserialize_processes(
         process_json = None
         process_ti = None
 
-        process_file_path = os.path.join(process_dir, file_name)
         _progress_start(progress, process_file_path, "reading process json")
         with open(process_file_path, 'r', encoding='utf-8') as file:
             try:
@@ -710,15 +915,30 @@ def deserialize_processes(
                 process_json = _json_load_text(data)
                 _progress_mark(progress, process_file_path)
             except Exception as e:
-                process_errors[process_link] = e.__repr__()
-                logger.warning("Failed to parse process json '%s': %s", file_name, e, exc_info=True)
+                process_errors.append(
+                    workflow_error_from_exception(
+                        workflow="deserialize",
+                        phase="process_json",
+                        subject=process_file_path,
+                        exception=e,
+                        severity="recoverable",
+                    )
+                )
                 _progress_mark(progress, process_file_path)
                 continue
 
         ti_file_name = file_name_base + '.ti'
         if ti_file_name not in files:
-            process_errors[process_link] = 'related ti not found at ' + Process.uri_for(file_name_base)
-            logger.warning("Missing TI pair for process json '%s'", file_name)
+            process_errors.append(
+                WorkflowError(
+                    workflow="deserialize",
+                    phase="process_ti",
+                    subject=os.path.join(process_dir, ti_file_name),
+                    exception_type="FileNotFoundError",
+                    message="related TI file not found",
+                    severity="recoverable",
+                )
+            )
             continue
 
         ti_file_path = os.path.join(process_dir, ti_file_name)
@@ -729,8 +949,15 @@ def deserialize_processes(
                 process_ti = TI.from_string(data)
                 _progress_mark(progress, ti_file_path)
             except Exception as e:
-                process_errors[process_link] = e.__repr__()
-                logger.warning("Failed to parse process TI '%s': %s", ti_file_name, e, exc_info=True)
+                process_errors.append(
+                    workflow_error_from_exception(
+                        workflow="deserialize",
+                        phase="process_ti",
+                        subject=ti_file_path,
+                        exception=e,
+                        severity="recoverable",
+                    )
+                )
                 _progress_mark(progress, ti_file_path)
             finally:
                 files.pop(ti_file_name, None)
@@ -751,9 +978,15 @@ def deserialize_processes(
             if count_callback is not None:
                 count_callback(1)
         except Exception as e:
-            process_errors[process_link] = e.__repr__()
-            logger.warning("Failed to build process object for '%s': %s", file_name, e, exc_info=True)
-
+            process_errors.append(
+                workflow_error_from_exception(
+                    workflow="deserialize",
+                    phase="process",
+                    subject=process_file_path,
+                    exception=e,
+                    severity="recoverable",
+                )
+            )
     return processes, process_errors
 
 
@@ -800,26 +1033,32 @@ def deserialize_dimensions(
     dimension_dir,
     model_id: str,
     *,
-    progress: ProgressEvent,
+    progress: ProgressSink,
     count_callback: Optional[Callable[[int], None]] = None,
     thread_pool_executor: ThreadPoolExecutor,
     content_hash_calculator: ContentHashCalculator,
-) -> tuple[Dict[str, Dimension], Dict[str, str]]:
+) -> tuple[Dict[str, Dimension], list[WorkflowError]]:
     model_id = model_id.strip()
     if not model_id:
         raise ValueError("model_id must not be empty")
     dimensions: Dict[str, Dimension] = {}
-    dimension_errors: Dict[str, str] = {}
-    logger.debug("Deserializing dimensions from '%s'", dimension_dir)
-
+    dimension_errors: list[WorkflowError] = []
     files = directory_to_dict(dimension_dir)
     for file_name in sorted(list(files.keys())):
         file_name_base, dot, file_name_ext = file_name.rpartition('.')
-        dim_link = Dimension.uri_for(file_name_base)
+        dim_file_path = os.path.join(dimension_dir, file_name)
 
         if file_name_ext not in ['json', 'hierarchies']:
-            dimension_errors[dim_link] = 'not a dimension json or .hierarchies folder'
-            logger.warning("Skipping non-dimension artifact: '%s'", file_name)
+            dimension_errors.append(
+                WorkflowError(
+                    workflow="deserialize",
+                    phase="dimension_artifact",
+                    subject=dim_file_path,
+                    exception_type="UnsupportedArtifact",
+                    message="not a dimension json or .hierarchies folder",
+                    severity="recoverable",
+                )
+            )
             _progress_mark(progress, os.path.join(dimension_dir, file_name))
             continue
         if file_name_ext != 'json':
@@ -829,15 +1068,21 @@ def deserialize_dimensions(
         dim_json = None
 
         try:
-            dim_file_path = os.path.join(dimension_dir, file_name)
             _progress_start(progress, dim_file_path, "reading dimension")
             with open(dim_file_path, 'r', encoding='utf-8') as file:
                 data = file.read()
                 dim_json = _json_load_text(data)
                 _progress_mark(progress, dim_file_path)
         except Exception as e:
-            dimension_errors[dim_link] = e.__repr__()
-            logger.warning("Failed to parse dimension json '%s': %s", file_name, e, exc_info=True)
+            dimension_errors.append(
+                workflow_error_from_exception(
+                    workflow="deserialize",
+                    phase="dimension_json",
+                    subject=dim_file_path,
+                    exception=e,
+                    severity="recoverable",
+                )
+            )
             _progress_mark(progress, dim_file_path)
             continue
 
@@ -846,23 +1091,38 @@ def deserialize_dimensions(
             _dimension = Dimension(name=dim_name, hierarchies=[], defaultHierarchy=None)
             dimension_object_count = 1
         except Exception as e:
-            dimension_errors[dim_link] = e.__repr__()
-            logger.warning("Failed to build dimension object for '%s': %s", file_name, e, exc_info=True)
+            dimension_errors.append(
+                workflow_error_from_exception(
+                    workflow="deserialize",
+                    phase="dimension",
+                    subject=dim_file_path,
+                    exception=e,
+                    severity="recoverable",
+                )
+            )
             continue
 
         hier_dir_name = file_name_base + '.hierarchies'
         hier_dir_path = os.path.join(dimension_dir, hier_dir_name)
 
         if hier_dir_name not in files and not os.path.isdir(hier_dir_path):
-            dimension_errors[dim_link] = 'no hierarchies found'
-            logger.warning("No hierarchy directory found for dimension '%s'", file_name)
+            dimension_errors.append(
+                WorkflowError(
+                    workflow="deserialize",
+                    phase="dimension_hierarchies",
+                    subject=hier_dir_path,
+                    exception_type="FileNotFoundError",
+                    message="no hierarchies found",
+                    severity="recoverable",
+                )
+            )
             continue
 
         hiers = files.get(hier_dir_name)
         parsed_hierarchies: dict[str, Hierarchy] = {}
         
-        hierarchy_futures_dict: dict[str, Future] = {}
-        for hier_file_name in sorted(list(hiers.keys())):
+        hierarchy_futures: list[HierarchyFutureMetadata] = []
+        for submission_index, hier_file_name in enumerate(sorted(list(hiers.keys()))):
             hierarchy_file_path = os.path.join(hier_dir_path, hier_file_name)
             _progress_start(progress, hierarchy_file_path, "reading hierarchy")
             # Ignore temporary/in-progress hierarchy artifacts.
@@ -870,11 +1130,17 @@ def deserialize_dimensions(
                 _progress_mark(progress, hierarchy_file_path)
                 continue
             hier_file_name_base, dot, file_name_ext = hier_file_name.rpartition('.')
-            hier_link = Hierarchy.uri_for(file_name_base, hier_file_name_base)
-
             if file_name_ext not in ['json', 'subsets']:
-                dimension_errors[hier_link] = 'not a hierarchy json or .subset folder'
-                logger.warning("Skipping non-hierarchy artifact: '%s'", hier_file_name)
+                dimension_errors.append(
+                    WorkflowError(
+                        workflow="deserialize",
+                        phase="hierarchy_artifact",
+                        subject=hierarchy_file_path,
+                        exception_type="UnsupportedArtifact",
+                        message="not a hierarchy json or .subset folder",
+                        severity="recoverable",
+                    )
+                )
                 _progress_mark(progress, hierarchy_file_path)
                 continue
             if file_name_ext != 'json':
@@ -894,13 +1160,25 @@ def deserialize_dimensions(
                 thread_pool_executor=thread_pool_executor,
                 content_hash_calculator=content_hash_calculator,
             )
-            hierarchy_futures_dict[hier_file_name_base] = future
+            hierarchy_futures.append(
+                HierarchyFutureMetadata(
+                    submission_index=submission_index,
+                    dimension_name=file_name_base,
+                    hierarchy_name=hier_file_name_base,
+                    hierarchy_json_path=hierarchy_file_path,
+                    future=future,
+                )
+            )
 
-        for future in concurrent.futures.as_completed(hierarchy_futures_dict.values()):
-            
+        hierarchy_futures_by_future = {
+            metadata.future: metadata
+            for metadata in hierarchy_futures
+        }
+        hierarchy_future_errors: list[tuple[int, WorkflowError]] = []
+        for future in concurrent.futures.as_completed(hierarchy_futures_by_future):
+            metadata = hierarchy_futures_by_future[future]
             try:
                 _hierarchy = future.result()
-                hier_file_name = _hierarchy.name + ".json"
                 parsed_hierarchies[_hierarchy.name] = _hierarchy
                 _dimension.hierarchies.append(_hierarchy)
                 hierarchy_object_count = 1 + len(_hierarchy.subsets) + len(_hierarchy.edges)
@@ -908,15 +1186,25 @@ def deserialize_dimensions(
                     hierarchy_object_count += len(_hierarchy.elements)
                 dimension_object_count += hierarchy_object_count
             except Exception as e:
-                hier_link = Hierarchy.uri_for(file_name_base, hier_file_name_base)
-                dimension_errors[hier_link] = str(e)
-                logger.warning(
-                    "Failed to parse/build hierarchy '%s' for dimension '%s': %s",
-                    hier_file_name,
-                    file_name,
-                    e,
-                    exc_info=True,
+                hierarchy_future_errors.append(
+                    (
+                        metadata.submission_index,
+                        workflow_error_from_exception(
+                            workflow="deserialize",
+                            phase="hierarchy",
+                            subject=Hierarchy.uri_for(
+                                metadata.dimension_name,
+                                metadata.hierarchy_name,
+                            ),
+                            exception=e,
+                            severity="recoverable",
+                        ),
+                    )
                 )
+        dimension_errors.extend(
+            error
+            for _, error in sorted(hierarchy_future_errors, key=lambda item: item[0])
+        )
 
         pattern = r"Dimensions\('([^']*)'\)/Hierarchies\('([^']*)'\)"
         default_hierarchy_payload = dim_json.get("DefaultHierarchy")
@@ -927,18 +1215,46 @@ def deserialize_dimensions(
                 or default_hierarchy_payload.get("id")
             )
         match = re.search(pattern, default_hierarchy_ref or "")
+        configured_default_hierarchy: Optional[Hierarchy] = None
+        default_hierarchy_error: Optional[WorkflowError] = None
         if match:
             _, default_hierarchy_name = match.groups()
             resolved_default_hierarchy_name = unquote(default_hierarchy_name)
-            _dimension.defaultHierarchy = (
+            configured_default_hierarchy = (
                 parsed_hierarchies.get(default_hierarchy_name)
                 or parsed_hierarchies.get(resolved_default_hierarchy_name)
             )
+            if configured_default_hierarchy is None:
+                default_hierarchy_error = WorkflowError(
+                    workflow="deserialize",
+                    phase="default_hierarchy",
+                    subject=dim_file_path,
+                    exception_type="ValueError",
+                    message="configured default hierarchy could not be resolved",
+                    severity="recoverable",
+                )
+        else:
+            default_hierarchy_error = WorkflowError(
+                workflow="deserialize",
+                phase="default_hierarchy",
+                subject=dim_file_path,
+                exception_type="ValueError",
+                message="no default hierarchy configured",
+                severity="recoverable",
+            )
 
-        if not _dimension.defaultHierarchy:
-            dimension_errors[dim_link] = 'no default hierarchy'
-            logger.warning("No default hierarchy resolved for dimension '%s'", file_name)
+        if not _dimension.hierarchies:
+            if default_hierarchy_error is not None:
+                dimension_errors.append(default_hierarchy_error)
             continue
+
+        _dimension.defaultHierarchy = Dimension._select_default_hierarchy(
+            dimension_name=_dimension.name,
+            hierarchies=_dimension.hierarchies,
+            default_hierarchy=configured_default_hierarchy,
+        )
+        if default_hierarchy_error is not None:
+            dimension_errors.append(default_hierarchy_error)
         dimensions[_dimension.name] = _dimension
         if count_callback is not None:
             count_callback(dimension_object_count)
@@ -951,21 +1267,26 @@ def deserialize_cubes(
     *,
     progress: Optional[ProgressSink] = None,
     count_callback: Optional[Callable[[int], None]] = None,
-) -> tuple[Dict[str, Cube], Dict[str, str]]:
+) -> tuple[Dict[str, Cube], list[WorkflowError]]:
     progress = progress if progress is not None else NoopProgressSink()
     cubes: Dict[str, Cube] = {}
-    cube_errors: Dict[str, str] = {}
-    logger.debug("Deserializing cubes from '%s'", cubes_dir)
-
+    cube_errors: list[WorkflowError] = []
     files = directory_to_dict(cubes_dir)
     for file_name in list(files.keys()):
         file_name_base, dot, file_name_ext = file_name.rpartition('.')
-        cube_link = Cube.uri_for(file_name_base)
+        cube_artifact_path = os.path.join(cubes_dir, file_name)
 
         if file_name_ext not in ['json', 'rules', 'views']:
-            cube_errors[cube_link] = 'not a dimension json or .rules or .views folder'
-            logger.warning("Skipping non-cube artifact: '%s'", file_name)
-            cube_artifact_path = os.path.join(cubes_dir, file_name)
+            cube_errors.append(
+                WorkflowError(
+                    workflow="deserialize",
+                    phase="cube_artifact",
+                    subject=cube_artifact_path,
+                    exception_type="UnsupportedArtifact",
+                    message="not a cube json or .rules or .views folder",
+                    severity="recoverable",
+                )
+            )
             _progress_start(progress, cube_artifact_path, "skipping non-cube artifact")
             _progress_mark(progress, cube_artifact_path)
             continue
@@ -977,9 +1298,23 @@ def deserialize_cubes(
 
         cube_file_path = os.path.join(cubes_dir, file_name)
         _progress_start(progress, cube_file_path, "reading cube")
-        with open(cube_file_path, 'r', encoding='utf-8') as file:
-            cube_json = _json_load_text(file.read())
+        try:
+            with open(cube_file_path, 'r', encoding='utf-8') as file:
+                cube_json = _json_load_text(file.read())
+        except Exception as e:
+            cube_errors.append(
+                workflow_error_from_exception(
+                    workflow="deserialize",
+                    phase="cube_json",
+                    subject=cube_file_path,
+                    exception=e,
+                    severity="recoverable",
+                )
+            )
             _progress_mark(progress, cube_file_path)
+            continue
+
+        try:
             rules_list = []
             rule_file_path = os.path.join(cubes_dir, file_name_base + '.rules')
             if os.path.exists(rule_file_path):
@@ -1014,13 +1349,37 @@ def deserialize_cubes(
                 views=[],
                 drillthrough_rules=drillthrough_rules_list,
             )
+        except Exception as e:
+            cube_errors.append(
+                workflow_error_from_exception(
+                    workflow="deserialize",
+                    phase="cube",
+                    subject=cube_file_path,
+                    exception=e,
+                    severity="recoverable",
+                )
+            )
+            _progress_mark(progress, cube_file_path)
+            continue
 
-        for dim in cube_json['Dimensions']:
-            pattern = r"Dimensions\('([^']*)'\)"
-            match = re.search(pattern, dim['@id'])
-            if match:
-                dimension_name = match.group(1)
-                _cube.dimensions.append(dimension_name)
+        try:
+            for dim in cube_json['Dimensions']:
+                pattern = r"Dimensions\('([^']*)'\)"
+                match = re.search(pattern, dim['@id'])
+                if match:
+                    dimension_name = match.group(1)
+                    _cube.dimensions.append(dimension_name)
+        except Exception as e:
+            cube_errors.append(
+                workflow_error_from_exception(
+                    workflow="deserialize",
+                    phase="cube_dimensions",
+                    subject=cube_file_path,
+                    exception=e,
+                    severity="recoverable",
+                )
+            )
+            continue
 
         view_dir_name = file_name_base + '.views'
         view_dir_path = os.path.join(cubes_dir, view_dir_name)
@@ -1039,14 +1398,16 @@ def deserialize_cubes(
                             view = _json_load_text(data)
                             _progress_mark(progress, os.path.join(view_dir_path, view_file_name))
                         except Exception as e:
-                            cube_errors[file_name_base + '.views/' + view_file_name] = e.__repr__()
-                            logger.warning(
-                                "Failed to parse view '%s' for cube '%s': %s",
-                                view_file_name,
-                                file_name_base,
-                                e,
-                                exc_info=True,
+                            cube_errors.append(
+                                workflow_error_from_exception(
+                                    workflow="deserialize",
+                                    phase="cube_view",
+                                    subject=os.path.join(view_dir_path, view_file_name),
+                                    exception=e,
+                                    severity="recoverable",
+                                )
                             )
+                            continue
                 else:
                     continue
 
@@ -1061,21 +1422,40 @@ def deserialize_cubes(
                                 mdx = file.read()
                                 _progress_mark(progress, os.path.join(view_dir_path, mdx_file_name))
                             except Exception as e:
-                                cube_errors[file_name_base + '.mdx'] = e.__repr__()
-                                logger.warning(
-                                    "Failed to parse mdx '%s' for cube '%s': %s",
-                                    mdx_file_name,
-                                    file_name_base,
-                                    e,
-                                    exc_info=True,
+                                cube_errors.append(
+                                    workflow_error_from_exception(
+                                        workflow="deserialize",
+                                        phase="cube_view_mdx",
+                                        subject=os.path.join(view_dir_path, mdx_file_name),
+                                        exception=e,
+                                        severity="recoverable",
+                                    )
                                 )
                         files.pop(mdx_file_name, None)
                     else:
-                        cube_errors[mdx_file_name] = 'mdx not found'
+                        cube_errors.append(
+                            WorkflowError(
+                                workflow="deserialize",
+                                phase="cube_view_mdx",
+                                subject=os.path.join(view_dir_path, mdx_file_name),
+                                exception_type="FileNotFoundError",
+                                message="mdx not found",
+                                severity="recoverable",
+                            )
+                        )
                         continue
 
                     if not mdx:
-                        cube_errors[mdx_file_name] = 'mdx cannot be parsed'
+                        cube_errors.append(
+                            WorkflowError(
+                                workflow="deserialize",
+                                phase="cube_view_mdx",
+                                subject=os.path.join(view_dir_path, mdx_file_name),
+                                exception_type="ValueError",
+                                message="mdx cannot be parsed",
+                                severity="recoverable",
+                            )
+                        )
                         continue
 
                     meta_raw = view.get("Meta")
@@ -1101,11 +1481,15 @@ def deserialize_cubes(
                         )
                     )
                 else:
-                    cube_errors[file_name_base + '.views/' + view_file_name] = "unsupported view type"
-                    logger.warning(
-                        "Unsupported view type for '%s' in cube '%s'",
-                        view_file_name,
-                        file_name_base,
+                    cube_errors.append(
+                        WorkflowError(
+                            workflow="deserialize",
+                            phase="cube_view",
+                            subject=os.path.join(view_dir_path, view_file_name),
+                            exception_type="UnsupportedArtifact",
+                            message="unsupported view type",
+                            severity="recoverable",
+                        )
                     )
         cubes[_cube.name] = _cube
         if count_callback is not None:
@@ -1159,7 +1543,6 @@ def _parse_rules(rule_text: str, cube_name: str) -> List[Rule]:
 def directory_to_dict(path):
     """Converts a directory structure to a nested dictionary."""
     if not os.path.isdir(path):
-        logger.debug("Directory '%s' not found, returning empty structure", path)
         return {}
     directory_dict = {}
     for item in os.listdir(path):

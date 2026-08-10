@@ -45,15 +45,15 @@ class TestDeserializer:
             assert isinstance(dimension, Dimension)
 
     def test_deserialize_model_forwards_max_workers(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(deserializer_module, "deserialize_processes", lambda *_a, **_k: ({}, {}))
-        monkeypatch.setattr(deserializer_module, "deserialize_chores", lambda *_a, **_k: ({}, {}))
-        monkeypatch.setattr(deserializer_module, "deserialize_cubes", lambda *_a, **_k: ({}, {}))
+        monkeypatch.setattr(deserializer_module, "deserialize_processes", lambda *_a, **_k: ({}, []))
+        monkeypatch.setattr(deserializer_module, "deserialize_chores", lambda *_a, **_k: ({}, []))
+        monkeypatch.setattr(deserializer_module, "deserialize_cubes", lambda *_a, **_k: ({}, []))
         observed: dict[str, object] = {}
 
         def _fake_dimensions(*_args, **kwargs):
             observed["thread_pool_executor"] = kwargs.get("thread_pool_executor")
             observed["content_hash_calculator"] = kwargs.get("content_hash_calculator")
-            return {}, {}
+            return {}, []
 
         monkeypatch.setattr(deserializer_module, "deserialize_dimensions", _fake_dimensions)
 
@@ -66,7 +66,335 @@ class TestDeserializer:
         expected_io_workers = resolve_worker_counts(max_workers=8, io_ratio=1).io_workers
         assert observed["thread_pool_executor"]._max_workers == expected_io_workers
         assert model.total_object_count == 0
-        assert errors == {}
+        assert errors == []
+
+    def test_deserialize_model_merges_helper_errors_and_notifies_callback_in_phase_order(
+        self, monkeypatch, tmp_path
+    ):
+        process_error = deserializer_module.WorkflowError(
+            workflow="deserialize",
+            phase="process_json",
+            subject=str(tmp_path / "processes" / "Broken.json"),
+            exception_type="JSONDecodeError",
+            message="invalid process",
+            severity="recoverable",
+        )
+        chore_error = deserializer_module.WorkflowError(
+            workflow="deserialize",
+            phase="chore",
+            subject=str(tmp_path / "chores" / "Broken.json"),
+            exception_type="KeyError",
+            message="missing chore field",
+            severity="recoverable",
+        )
+        dimension_error = deserializer_module.WorkflowError(
+            workflow="deserialize",
+            phase="dimension_json",
+            subject=str(tmp_path / "dimensions" / "Broken.json"),
+            exception_type="JSONDecodeError",
+            message="invalid dimension",
+            severity="recoverable",
+        )
+        cube_error = deserializer_module.WorkflowError(
+            workflow="deserialize",
+            phase="cube_view",
+            subject=str(tmp_path / "cubes" / "Broken.views" / "View.json"),
+            exception_type="JSONDecodeError",
+            message="invalid view",
+            severity="recoverable",
+        )
+        monkeypatch.setattr(
+            deserializer_module,
+            "deserialize_processes",
+            lambda *_a, **_k: ({}, [process_error]),
+        )
+        monkeypatch.setattr(
+            deserializer_module,
+            "deserialize_chores",
+            lambda *_a, **_k: ({}, [chore_error]),
+        )
+        monkeypatch.setattr(
+            deserializer_module,
+            "deserialize_dimensions",
+            lambda *_a, **_k: ({}, [dimension_error]),
+        )
+        monkeypatch.setattr(
+            deserializer_module,
+            "deserialize_cubes",
+            lambda *_a, **_k: ({}, [cube_error]),
+        )
+        received = []
+
+        model, errors = deserializer_module.deserialize_model(
+            str(tmp_path),
+            max_workers=2,
+            error_callback=received.append,
+        )
+
+        assert isinstance(model, Model)
+        assert errors == [process_error, chore_error, dimension_error, cube_error]
+        assert received == errors
+
+    def test_deserialize_model_returns_partial_model_after_fatal_phase_failure(
+        self, monkeypatch, tmp_path
+    ):
+        def fail_processes(*_args, **_kwargs):
+            raise RuntimeError("process folder unavailable")
+
+        deserialize_chores = mock.Mock(return_value=({}, []))
+        deserialize_dimensions = mock.Mock(return_value=({}, []))
+        deserialize_cubes = mock.Mock(return_value=({}, []))
+        monkeypatch.setattr(deserializer_module, "deserialize_chores", deserialize_chores)
+        monkeypatch.setattr(deserializer_module, "deserialize_dimensions", deserialize_dimensions)
+        monkeypatch.setattr(deserializer_module, "deserialize_cubes", deserialize_cubes)
+        monkeypatch.setattr(deserializer_module, "deserialize_processes", fail_processes)
+
+        model, errors = deserializer_module.deserialize_model(str(tmp_path), max_workers=2)
+
+        assert isinstance(model, Model)
+        assert model.processes == []
+        assert [(error.phase, error.severity) for error in errors] == [
+            ("processes", "fatal"),
+        ]
+        deserialize_chores.assert_called_once()
+        deserialize_dimensions.assert_called_once()
+        deserialize_cubes.assert_called_once()
+
+    def test_deserialize_model_preserves_interrupt_and_closes_progress_manager(
+        self, monkeypatch, tmp_path
+    ):
+        managers = []
+
+        class FakeProgressManager:
+            def __init__(self, sink):
+                self.sink = sink
+                self.started = False
+                self.closed = False
+                managers.append(self)
+
+            def start(self):
+                self.started = True
+
+            def get_multi_process_progress_queue_sink(self):
+                return self.sink
+
+            def close(self):
+                self.closed = True
+
+        progress_sink = mock.Mock()
+        progress_sink.on_event.side_effect = KeyboardInterrupt
+        monkeypatch.setattr(
+            deserializer_module,
+            "MultiProcessProgressManager",
+            FakeProgressManager,
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            deserializer_module.deserialize_model(
+                str(tmp_path),
+                progress_sink=progress_sink,
+                max_workers=8,
+            )
+
+        assert len(managers) == 1
+        assert managers[0].started is True
+        assert managers[0].closed is True
+
+    def test_deserialize_model_logs_lifecycle_and_each_collected_error_once(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        error = deserializer_module.WorkflowError(
+            workflow="deserialize",
+            phase="process_json",
+            subject=str(tmp_path / "processes" / "Broken.json"),
+            exception_type="JSONDecodeError",
+            message="invalid process",
+            severity="recoverable",
+        )
+        monkeypatch.setattr(
+            deserializer_module,
+            "deserialize_processes",
+            lambda *_a, **_k: ({}, [error]),
+        )
+        monkeypatch.setattr(deserializer_module, "deserialize_chores", lambda *_a, **_k: ({}, []))
+        monkeypatch.setattr(deserializer_module, "deserialize_dimensions", lambda *_a, **_k: ({}, []))
+        monkeypatch.setattr(deserializer_module, "deserialize_cubes", lambda *_a, **_k: ({}, []))
+
+        with caplog.at_level("DEBUG", logger=deserializer_module.__name__):
+            _model, errors = deserializer_module.deserialize_model(str(tmp_path), max_workers=2)
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == deserializer_module.__name__
+        ]
+        error_messages = [
+            message for message in messages
+            if message.startswith("Model deserialization error ")
+        ]
+        assert errors == [error]
+        assert any(message.startswith("Starting model deserialization ") for message in messages)
+        assert "Model deserialization completed with errors total=1 recoverable=1 fatal=0" in messages
+        assert len(error_messages) == 1
+        assert not [
+            record for record in caplog.records
+            if record.name == deserializer_module.__name__
+            and record.levelname == "DEBUG"
+        ]
+
+    def test_deserialize_chores_keeps_valid_chore_after_unsupported_artifact(self, tmp_path):
+        chores_dir = tmp_path / "chores"
+        chores_dir.mkdir()
+        (chores_dir / "Good.json").write_text(
+            json.dumps(
+                {
+                    "Name": "Good",
+                    "StartTime": "00:00:00",
+                    "DSTSensitive": False,
+                    "Active": True,
+                    "ExecutionMode": "SingleCommit",
+                    "Frequency": "P0Y0M1DT0H0M0S",
+                    "Tasks": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        unsupported_path = chores_dir / "notes.txt"
+        unsupported_path.write_text("not a chore", encoding="utf-8")
+
+        chores, errors = deserialize_chores(chores_dir)
+
+        assert list(chores) == ["Good"]
+        assert [(error.phase, error.subject, error.severity) for error in errors] == [
+            ("chore_artifact", str(unsupported_path), "recoverable"),
+        ]
+
+    def test_deserialize_cubes_keeps_valid_cube_after_malformed_cube_artifact(self, tmp_path):
+        cubes_dir = tmp_path / "cubes"
+        cubes_dir.mkdir()
+        broken_cube_path = cubes_dir / "Broken.json"
+        broken_cube_path.write_text("{invalid json", encoding="utf-8")
+        (cubes_dir / "Good.json").write_text(
+            json.dumps({"Name": "Good", "Dimensions": []}),
+            encoding="utf-8",
+        )
+
+        cubes, errors = deserialize_cubes(cubes_dir, _dimensions={})
+
+        assert list(cubes) == ["Good"]
+        assert [(error.phase, error.subject, error.severity) for error in errors] == [
+            ("cube_json", str(broken_cube_path), "recoverable"),
+        ]
+
+    def test_deserialize_process_reports_missing_ti_pair_with_the_missing_path(self, tmp_path):
+        processes_dir = tmp_path / "processes"
+        processes_dir.mkdir()
+        (processes_dir / "MissingTi.json").write_text(
+            json.dumps(
+                {
+                    "Name": "MissingTi",
+                    "HasSecurityAccess": False,
+                    "Code@Code.link": "MissingTi.ti",
+                    "Parameters": [],
+                    "Variables": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        processes, errors = deserialize_processes(processes_dir)
+
+        assert processes == {}
+        assert [(error.phase, error.subject, error.exception_type) for error in errors] == [
+            ("process_ti", str(processes_dir / "MissingTi.ti"), "FileNotFoundError"),
+        ]
+
+    def test_deserialize_dimensions_keeps_valid_hierarchy_when_configured_default_fails(
+        self, tmp_path, monkeypatch
+    ):
+        dimensions_dir = tmp_path / "dimensions"
+        hierarchy_dir = dimensions_dir / "MyDim.hierarchies"
+        hierarchy_dir.mkdir(parents=True)
+        dimension_path = dimensions_dir / "MyDim.json"
+        dimension_path.write_text(
+            json.dumps(
+                {
+                    "Name": "MyDim",
+                    "DefaultHierarchy": {
+                        "@id": "Dimensions('MyDim')/Hierarchies('Broken')"
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (hierarchy_dir / "Broken.json").write_text("{}", encoding="utf-8")
+        (hierarchy_dir / "Valid.json").write_text("{}", encoding="utf-8")
+
+        def fake_hierarchy(*, hierarchy_name, **_kwargs):
+            if hierarchy_name == "Broken":
+                raise RuntimeError("broken hierarchy")
+            return Hierarchy(name=hierarchy_name, elements=[], edges=[], subsets=[])
+
+        monkeypatch.setattr(deserializer_module, "_deserialize_single_hierarchy", fake_hierarchy)
+
+        dimensions, errors = _call_deserialize_dimensions(dimensions_dir, tmp_path.name)
+
+        assert list(dimensions) == ["MyDim"]
+        assert dimensions["MyDim"].defaultHierarchy.name == "Valid"
+        assert [(error.phase, error.subject) for error in errors] == [
+            ("hierarchy", "Dimensions('MyDim')/Hierarchies('Broken')"),
+            ("default_hierarchy", str(dimension_path)),
+        ]
+
+    def test_deserialize_dimensions_orders_hierarchy_future_errors_by_submission(
+        self, tmp_path, monkeypatch
+    ):
+        import time
+
+        dimensions_dir = tmp_path / "dimensions"
+        hierarchy_dir = dimensions_dir / "MyDim.hierarchies"
+        hierarchy_dir.mkdir(parents=True)
+        (dimensions_dir / "MyDim.json").write_text(
+            json.dumps(
+                {
+                    "Name": "MyDim",
+                    "DefaultHierarchy": {
+                        "@id": "Dimensions('MyDim')/Hierarchies('Valid')"
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        for name in ("AFail", "BFail", "Valid"):
+            (hierarchy_dir / f"{name}.json").write_text("{}", encoding="utf-8")
+
+        def fake_hierarchy(*, hierarchy_name, **_kwargs):
+            if hierarchy_name == "AFail":
+                time.sleep(0.03)
+                raise RuntimeError("A failed")
+            if hierarchy_name == "BFail":
+                raise RuntimeError("B failed")
+            return Hierarchy(name=hierarchy_name, elements=[], edges=[], subsets=[])
+
+        monkeypatch.setattr(deserializer_module, "_deserialize_single_hierarchy", fake_hierarchy)
+        store = ModelStore.for_model_id(tmp_path.name + "_ordered")
+        with ThreadPoolExecutor(max_workers=3) as thread_pool_executor, ContentHashCalculator(
+            db_path=store.db_path,
+            max_workers=1,
+        ) as content_hash_calculator:
+            dimensions, errors = deserializer_module.deserialize_dimensions(
+                dimensions_dir,
+                tmp_path.name + "_ordered",
+                progress=_NoopProgressSink(),
+                thread_pool_executor=thread_pool_executor,
+                content_hash_calculator=content_hash_calculator,
+            )
+
+        assert list(dimensions) == ["MyDim"]
+        assert [error.subject for error in errors] == [
+            "Dimensions('MyDim')/Hierarchies('AFail')",
+            "Dimensions('MyDim')/Hierarchies('BFail')",
+        ]
 
     def test_tqdm_deserializer_sink_uses_dynamic_worker_slots(self, tmp_path):
         sink = TqdmProgressSink(worker_count=6, thread_tracing_enabled=True)
@@ -309,7 +637,7 @@ class TestDeserializer:
             source_dimensions_dir,
             tmp_path.name + "_deserialized",
         )
-        assert errors == {}
+        assert errors == []
 
         roundtrip_dimensions_dir = tmp_path / "roundtrip" / "dimensions"
         roundtrip_dimensions_dir.mkdir(parents=True)
@@ -365,7 +693,7 @@ class TestDeserializer:
             source_dimensions_dir,
             tmp_path.name + "_in_memory_deserialized",
         )
-        assert errors == {}
+        assert errors == []
 
         roundtrip_dimensions_dir = tmp_path / "roundtrip_in_memory" / "dimensions"
         roundtrip_dimensions_dir.mkdir(parents=True)
@@ -446,7 +774,7 @@ class TestDeserializer:
 
         dimensions, errors = _call_deserialize_dimensions(dimensions_dir, tmp_path.name)
         assert "testbenchVersion" in dimensions
-        assert not any("inprogress" in key for key in errors.keys())
+        assert not any("inprogress" in (error.subject or "") for error in errors)
 
     def test_deserialize_dimensions_accepts_default_hierarchy_id_object(self, tmp_path):
         src_dimensions = test_model_dir_base / "dimensions"
@@ -463,11 +791,7 @@ class TestDeserializer:
         dimensions, errors = _call_deserialize_dimensions(dimensions_dir, tmp_path.name)
         assert "testbenchVersion" in dimensions
         assert dimensions["testbenchVersion"].defaultHierarchy.name == "testbenchVersion"
-        assert (
-            "Dimensions('testbenchVersion')" not in errors
-            and "Dimensions('testbenchVersion')/Hierarchies('testbenchVersion')"
-            not in errors
-        )
+        assert not errors
 
     def test_get_subsets_uses_collector(self, monkeypatch):
         tm1_conn = mock.Mock()
@@ -578,7 +902,7 @@ class TestDeserializer:
 
         dimensions, errors = _call_deserialize_dimensions(dimensions_dir, tmp_path.name)
 
-        assert errors == {}
+        assert errors == []
         hierarchy_obj = dimensions["MyDim"].hierarchies[0]
         assert hierarchy_obj.elements_sort_type == "ByInput"
         assert hierarchy_obj.elements_sort_sense == "Descending"
@@ -635,7 +959,7 @@ class TestDeserializer:
 
         dimensions, errors = _call_deserialize_dimensions(dimensions_dir, tmp_path.name)
 
-        assert errors == {}
+        assert errors == []
         hierarchy_obj = dimensions["MyDim"].hierarchies[0]
         assert hierarchy_obj.elements_sort_type is None
         assert hierarchy_obj.elements_sort_sense is None
@@ -679,7 +1003,7 @@ class TestDeserializer:
 
         dimensions, errors = _call_deserialize_dimensions(dimensions_dir, tmp_path.name)
 
-        assert errors == {}
+        assert errors == []
         hierarchy_obj = dimensions["MyDim"].hierarchies[0]
         assert hierarchy_obj.elements_sort_type == "ByName"
         assert hierarchy_obj.elements_sort_sense == "Ascending"
@@ -1435,7 +1759,7 @@ class TestDeserializer:
 
         cubes, errors = deserialize_cubes(cubes_dir=cubes_dir, _dimensions={})
 
-        assert errors == {}
+        assert errors == []
         assert cubes["Organization Units Settings"].dimensions == ["Versions", "Organization Units"]
 
     def test_deserialize_cubes_loads_drillthrough_rules_from_technical_rule_file(self, tmp_path):
@@ -1462,7 +1786,7 @@ class TestDeserializer:
 
         cubes, errors = deserialize_cubes(cubes_dir=cubes_dir, _dimensions={})
 
-        assert errors == {}
+        assert errors == []
         cube = cubes["Sales"]
         assert cube.get_rule_text() == "[] = N: 1;"
         assert cube.get_drillthrough_rule_text() == "[]=s:'simple_drillthrough';"
@@ -1483,7 +1807,7 @@ class TestDeserializer:
 
         cubes, errors = deserialize_cubes(cubes_dir=cubes_dir, _dimensions={})
 
-        assert errors == {}
+        assert errors == []
         assert cubes["Sales"].drillthrough_rules == []
 
 
@@ -1526,7 +1850,7 @@ class TestDeserializer:
 
         processes, errors = deserialize_processes(process_dir=processes_dir)
 
-        assert errors == {}
+        assert errors == []
         proc = processes[process_name]
         assert proc.datasource == {
             "Type": "ASCII",
@@ -1548,10 +1872,9 @@ class TestDeserializer:
         dimensions, errors = _call_deserialize_dimensions(dimensions_dir, tmp_path.name)
 
         assert not dimensions, f"Broken {type(dimensions.values())} file should not deserialize successfully"
-        expected_key = Dimension.uri_for("BrokenDimension")
-        assert expected_key in errors, (
-            f"Error key '{expected_key}' missing; collected keys: {list(errors.keys())}"
-        )
+        assert len(errors) == 1
+        assert errors[0].workflow == "deserialize"
+        assert Path(errors[0].subject).parent == broken_dims.parent
 
 
     @pytest.mark.parametrize("data", chore_data)
@@ -1565,10 +1888,9 @@ class TestDeserializer:
         chores, errors = deserialize_chores(chores_dir)
 
         assert not chores, f"Broken {type(chores.values())} file should not deserialize successfully"
-        expected_key = Chore.uri_for("BrokenChores")
-        assert expected_key in errors, (
-            f"Error key '{expected_key}' missing; collected keys: {list(errors.keys())}"
-        )
+        assert len(errors) == 1
+        assert errors[0].workflow == "deserialize"
+        assert errors[0].subject == str(broken_chore)
 
 
     @pytest.mark.parametrize("data", process_data)
@@ -1582,7 +1904,6 @@ class TestDeserializer:
         processes, errors = deserialize_processes(processes_dir)
 
         assert not processes, f"Broken {type(processes.values())} file should not deserialize successfully"
-        expected_key = Process.uri_for("BrokenProcess")
-        assert expected_key in errors, (
-            f"Error key '{expected_key}' missing; collected keys: {list(errors.keys())}"
-        )
+        assert len(errors) == 1
+        assert errors[0].workflow == "deserialize"
+        assert Path(errors[0].subject).parent == broken_process.parent

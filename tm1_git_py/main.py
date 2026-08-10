@@ -32,6 +32,7 @@ from tm1_git_py.reporting.progress_reporting import (
     ProgressSink,
     TqdmProgressSink,
 )
+from tm1_git_py.reporting.error_reporting import WorkflowError
 from tm1_git_py.services.changeset import import_changeset
 from tm1_git_py.services.comparator import Comparator
 from tm1_git_py.services.deserializer import deserialize_model
@@ -86,7 +87,7 @@ def _deserialize_model_worker(
     model_dir: str,
     progress_sink: ProgressSink,
     max_workers: int,
-) -> tuple[Model, dict[str, str]]:
+) -> tuple[Model, list[WorkflowError]]:
 
     model, errors = deserialize_model(
         model_dir,
