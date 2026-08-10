@@ -1177,7 +1177,9 @@ class TestChangesetApply:
     ):
         comparator = Comparator()
         rules = FilterRules(filter_rules) if filter_rules is not None else None
-        return comparator.compare(source, target, mode=mode, filter_rules=rules)
+        changeset, errors = comparator.compare(source, target, mode=mode, filter_rules=rules)
+        assert not errors, errors
+        return changeset
 
     def apply(self, changeset: Changeset):
         status_dir = "test_integration"

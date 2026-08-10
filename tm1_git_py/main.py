@@ -33,7 +33,7 @@ from tm1_git_py.reporting.progress_reporting import (
     TqdmProgressSink,
 )
 from tm1_git_py.services.changeset import import_changeset
-from tm1_git_py.services.comparator import Comparator, TqdmComparatorProgressSink
+from tm1_git_py.services.comparator import Comparator
 from tm1_git_py.services.deserializer import deserialize_model
 from tm1_git_py.services.exporter import export
 from tm1_git_py.services.filter import FilterRules, import_filter
@@ -353,13 +353,15 @@ def _cmd_compare(args: argparse.Namespace) -> None:
 
             comparator = Comparator()
 
-            changeset = comparator.compare(
+            changeset, compare_errors = comparator.compare(
                 model_source,
                 model_target,
                 mode=args.mode,
                 filter_rules=extra_filter,
                 progress_sink=queuing_progress_sink,
             )
+            if compare_errors:
+                logger.warning("Comparison reported %d error(s)", len(compare_errors))
         
         except KeyboardInterrupt:
             if pool is not None:

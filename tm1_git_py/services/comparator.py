@@ -26,6 +26,12 @@ from tm1_git_py.reporting.progress_reporting import (
     ProgressSink,
     ProgressUnit,
 )
+from tm1_git_py.reporting.error_reporting import (
+    ErrorCallback,
+    WorkflowError,
+    collect_worker_errors,
+    workflow_error_from_exception,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +41,28 @@ class _CompareObjectListsResult:
     matched_pairs: dict[str, tuple[Any, Any]]
     added_items: list[Any]
     removed_items: list[Any]
+
+
+class ComparisonResult(tuple):
+    """Tuple result with a temporary Changeset-compatible attribute bridge.
+
+    The public contract is ``(changeset, errors)``.  Attribute delegation keeps
+    existing integrations functional during their explicit result migration.
+    """
+
+    def __new__(cls, changeset: Changeset, errors: list[WorkflowError]):
+        return super().__new__(cls, (changeset, errors))
+
+    @property
+    def changeset(self) -> Changeset:
+        return self[0]
+
+    @property
+    def errors(self) -> list[WorkflowError]:
+        return self[1]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.changeset, name)
 
 
 class TqdmComparatorProgressSink:
@@ -145,38 +173,28 @@ class TqdmComparatorProgressSink:
 
 
 def _dimensions_equal_shallow(old_dimension: Dimension, new_dimension: Dimension) -> bool:
-    try:
-        if old_dimension.name != new_dimension.name:
-            return False
-
-        old_default = getattr(old_dimension.defaultHierarchy, "name", None)
-        new_default = getattr(new_dimension.defaultHierarchy, "name", None)
-        if old_default != new_default:
-            return False
-
-        return True
-
-    except AttributeError as exc:
-        logger.error("Dimension comparison failed due to missing attributes: %s", exc)
+    if old_dimension.name != new_dimension.name:
         return False
+
+    old_default = getattr(old_dimension.defaultHierarchy, "name", None)
+    new_default = getattr(new_dimension.defaultHierarchy, "name", None)
+    if old_default != new_default:
+        return False
+
+    return True
 
 
 def _hierarchies_equal_shallow(old_hierarchy: Hierarchy, new_hierarchy: Hierarchy) -> bool:
-    try:
-        if old_hierarchy.name != new_hierarchy.name:
-            return False
-        if hierarchy_sort_metadata_json(old_hierarchy) != hierarchy_sort_metadata_json(new_hierarchy):
-            return False
-        if hierarchy_has_sort_metadata(old_hierarchy) or hierarchy_has_sort_metadata(new_hierarchy):
-            if _hierarchy_element_order_signature(old_hierarchy) != _hierarchy_element_order_signature(new_hierarchy):
-                return False
-            if _hierarchy_edge_order_signature(old_hierarchy) != _hierarchy_edge_order_signature(new_hierarchy):
-                return False
-        return True
-
-    except AttributeError as exc:
-        logger.error("Hierarchy comparison failed due to missing attributes: %s", exc)
+    if old_hierarchy.name != new_hierarchy.name:
         return False
+    if hierarchy_sort_metadata_json(old_hierarchy) != hierarchy_sort_metadata_json(new_hierarchy):
+        return False
+    if hierarchy_has_sort_metadata(old_hierarchy) or hierarchy_has_sort_metadata(new_hierarchy):
+        if _hierarchy_element_order_signature(old_hierarchy) != _hierarchy_element_order_signature(new_hierarchy):
+            return False
+        if _hierarchy_edge_order_signature(old_hierarchy) != _hierarchy_edge_order_signature(new_hierarchy):
+            return False
+    return True
 
 
 def _hierarchy_element_order_signature(hierarchy: Hierarchy) -> dict[str, Optional[int]]:
@@ -235,20 +253,15 @@ def _optional_int(value: Any) -> Optional[int]:
 
 
 def _cubes_equal_shallow(old_cube: Cube, new_cube: Cube) -> bool:
-    try:
-        if old_cube.name != new_cube.name:
-            return False
-
-        old_dim_names = {str(getattr(dim, "name", dim)) for dim in old_cube.dimensions}
-        new_dim_names = {str(getattr(dim, "name", dim)) for dim in new_cube.dimensions}
-        if old_dim_names != new_dim_names:
-            return False
-
-        return True
-
-    except AttributeError as exc:
-        logger.error("Cube comparison failed due to missing attributes: %s", exc)
+    if old_cube.name != new_cube.name:
         return False
+
+    old_dim_names = {str(getattr(dim, "name", dim)) for dim in old_cube.dimensions}
+    new_dim_names = {str(getattr(dim, "name", dim)) for dim in new_cube.dimensions}
+    if old_dim_names != new_dim_names:
+        return False
+
+    return True
 
 
 def _uri_from_object(obj: Any, context: Optional[dict[str, str]] = None) -> str:
@@ -341,6 +354,66 @@ class Comparator:
         self._collection_progress_total = 0
         self._collection_progress_current = 0
         self._collection_progress_label = ""
+        self._comparison_errors: list[WorkflowError] = []
+
+    def _record_comparison_error(
+            self,
+            *,
+            phase: str,
+            subject: str,
+            exception: Exception,
+            severity: Literal["recoverable", "fatal"],
+    ) -> None:
+        """Collect a coordinator-side comparison diagnostic.
+
+        Comparator work is currently performed in the owning process.  Keeping
+        records on the comparator until ``compare`` completes means the public
+        callback has one owner and can never be invoked from an implementation
+        detail such as a child collection traversal.
+        """
+
+        error = workflow_error_from_exception(
+            workflow="compare",
+            phase=phase,
+            subject=subject or None,
+            exception=exception,
+            severity=severity,
+        )
+        # ``Cube.views`` is traversed once for each supported view class.  If
+        # the shared relation itself cannot be read, it is one failed relation,
+        # not two independent diagnostics.
+        if phase == "child_relation" and error in self._comparison_errors:
+            return
+        self._comparison_errors.append(error)
+
+    @staticmethod
+    def _error_sort_key(error: WorkflowError) -> tuple[str, str, str, str, str]:
+        """Use a stable coordinator order for returned records and callbacks."""
+        return (
+            error.phase,
+            error.subject or "",
+            error.exception_type,
+            error.message,
+            error.severity,
+        )
+
+    @staticmethod
+    def _log_comparison_errors(errors: Iterable[WorkflowError]) -> None:
+        """Emit each collected diagnostic once, from the comparison coordinator."""
+        for error in errors:
+            log = logger.warning if error.severity == "recoverable" else logger.error
+            log(
+                "Comparison diagnostic workflow=%s phase=%s subject=%s type=%s message=%s",
+                error.workflow,
+                error.phase,
+                error.subject or "<none>",
+                error.exception_type,
+                error.message,
+            )
+
+    @staticmethod
+    def _comparison_subject(obj: Any, context: Optional[dict[str, str]] = None) -> str:
+        return _resolve_change_uri(obj, context=context) or getattr(obj, "name", "") or type(obj).__name__
 
     def _is_uri_in_scope(self, object_uri: str) -> bool:
         if not object_uri:
@@ -452,50 +525,68 @@ class Comparator:
             progress_sink: Optional[ProgressSink] = None,
             mode: Literal['full', 'add_only'] = 'full',
             filter_rules: Optional[FilterRules] = None,
-    ) -> Changeset:
+            error_callback: Optional[ErrorCallback] = None,
+    ) -> tuple[Changeset, list[WorkflowError]]:
         """
         Compare two models and build a Changeset of Change entries.
         mode='full' emits add/remove/modify changes.
         mode='add_only' emits add/modify changes.
         """
 
+        changeset = Changeset()
+        errors: list[WorkflowError] = []
+        self._comparison_errors = errors
         self._progress_sink = progress_sink if progress_sink is not None else NoopProgressSink()
         self._compare_progress_total = 0
         self._compare_progress_current = 0
         try:
             logger.info("Starting model compare mode=%s", mode)
-            logger.debug(
-                "Input object counts old(cubes=%d dimensions=%d processes=%d chores=%d) "
-                "new(cubes=%d dimensions=%d processes=%d chores=%d)",
-                len(model1.cubes),
-                len(model1.dimensions),
-                len(model1.processes),
-                len(model1.chores),
-                len(model2.cubes),
-                len(model2.dimensions),
-                len(model2.processes),
-                len(model2.chores),
-            )
+            try:
+                self._active_filter_rules = apply_default_filter_rules(filter_rules)
+                phase_rows = [
+                    ("Cube", model1.cubes, model2.cubes, Cube),
+                    ("Dimension", model1.dimensions, model2.dimensions, Dimension),
+                    ("Process", model1.processes, model2.processes, Process),
+                    ("Chore", model1.chores, model2.chores, Chore),
+                ]
+                overall_object_total = (
+                    self._resolved_model_object_count(model1)
+                    + self._resolved_model_object_count(model2)
+                )
+                self._begin_compare_progress(overall_object_total)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                self._record_comparison_error(
+                    phase="setup",
+                    subject="models",
+                    exception=exc,
+                    severity="fatal",
+                )
+                return ComparisonResult(changeset, errors)
 
-            self._active_filter_rules = apply_default_filter_rules(filter_rules)
-            logger.debug(
-                "Using comparator filter rules: %s",
-                self._active_filter_rules._normalized_rules,
-            )
-
-            phase_rows = [
-                ("Cube", model1.cubes, model2.cubes, Cube),
-                ("Dimension", model1.dimensions, model2.dimensions, Dimension),
-                ("Process", model1.processes, model2.processes, Process),
-                ("Chore", model1.chores, model2.chores, Chore),
-            ]
-            overall_object_total = self._resolved_model_object_count(model1) + self._resolved_model_object_count(model2)
-            self._begin_compare_progress(overall_object_total)
-
-            changeset = Changeset()
             for object_type_name, old_rows, new_rows, parent_cls in phase_rows:
-                logger.debug("Comparing object type: %s", object_type_name)
-                self._compare_with_children(old_rows, new_rows, parent_cls, changeset, mode)
+                phase_error_count = len(errors)
+                phase_change_count = len(changeset.changes)
+                logger.info("Starting compare phase=%s", object_type_name)
+                try:
+                    self._compare_with_children(old_rows, new_rows, parent_cls, changeset, mode)
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as exc:
+                    self._record_comparison_error(
+                        phase="object_phase",
+                        subject=object_type_name,
+                        exception=exc,
+                        severity="fatal",
+                    )
+                finally:
+                    logger.info(
+                        "Completed compare phase=%s changes=%d errors=%d",
+                        object_type_name,
+                        len(changeset.changes) - phase_change_count,
+                        len(errors) - phase_error_count,
+                    )
 
             # cube_rule_texts = {cube.name: cube.get_rule_text() for cube in model2.cubes}
             # changeset.unify_rule_changes(cube_rule_texts=cube_rule_texts)
@@ -511,16 +602,40 @@ class Comparator:
             #     summary.get("remove", 0),
             #     summary.get("modify", 0),
             # )
-            self._emit_progress_event(
-                kind=ProgressKind.UPDATE,
-                scope=ProgressScope.TOTAL,
-                unit=ProgressUnit.LINE,
-                current=self._compare_progress_total,
-                total=self._compare_progress_total,
-                message="compare complete",
-            )
-            return changeset
+            try:
+                self._emit_progress_event(
+                    kind=ProgressKind.UPDATE,
+                    scope=ProgressScope.TOTAL,
+                    unit=ProgressUnit.LINE,
+                    current=self._compare_progress_total,
+                    total=self._compare_progress_total,
+                    message="compare complete",
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                self._record_comparison_error(
+                    phase="finalization",
+                    subject="changeset",
+                    exception=exc,
+                    severity="fatal",
+                )
+            return ComparisonResult(changeset, errors)
         finally:
+            errors.sort(key=self._error_sort_key)
+            self._log_comparison_errors(errors)
+            logger.info(
+                "Completed model compare mode=%s changes=%d errors=%d recoverable=%d fatal=%d",
+                mode,
+                len(changeset.changes),
+                len(errors),
+                sum(error.severity == "recoverable" for error in errors),
+                sum(error.severity == "fatal" for error in errors),
+            )
+            # A callback belongs to this coordinator, not to an object or
+            # relation traversal.  It sees the exact collected result once.
+            if error_callback is not None:
+                collect_worker_errors([], errors, error_callback=error_callback)
             self._progress_sink = None
             self._active_filter_rules = None
             self._compare_progress_total = 0
@@ -528,6 +643,7 @@ class Comparator:
             self._collection_progress_total = 0
             self._collection_progress_current = 0
             self._collection_progress_label = ""
+            self._comparison_errors = []
 
     def _enqueue_batched_change(
             self,
@@ -637,15 +753,15 @@ class Comparator:
         if child_relations and parent_pairs:
             for old_obj, new_obj in parent_pairs.values():
                 for child_attr, child_cls in child_relations:
-                    slot_old = getattr(old_obj, child_attr, None) or []
-                    slot_new = getattr(new_obj, child_attr, None) or []
-                    if isinstance(slot_old, StoreBackedSequence) and isinstance(slot_new, StoreBackedSequence):
-                        old_children = slot_old
-                        new_children = slot_new
-                    else:
-                        old_children = _ensure_elements_of_type(slot_old, child_cls)
-                        new_children = _ensure_elements_of_type(slot_new, child_cls)
                     try:
+                        slot_old = getattr(old_obj, child_attr, None) or []
+                        slot_new = getattr(new_obj, child_attr, None) or []
+                        if isinstance(slot_old, StoreBackedSequence) and isinstance(slot_new, StoreBackedSequence):
+                            old_children = slot_old
+                            new_children = slot_new
+                        else:
+                            old_children = _ensure_elements_of_type(slot_old, child_cls)
+                            new_children = _ensure_elements_of_type(slot_new, child_cls)
                         child_context = dict(context or {})
                         if parent_cls is Cube:
                             child_context["cube_name"] = getattr(new_obj, "name", "")
@@ -656,53 +772,73 @@ class Comparator:
                         if parent_cls is Hierarchy:
                             child_context["hierarchy_name"] = getattr(new_obj, "name", "")
                         self._compare_with_children(old_children, new_children, child_cls, changeset, mode, context=child_context)
-                    except Exception as exc:
-                        logger.error(
-                            "Child comparison failed for relation '%s' of %s: %s",
-                            child_attr,
-                            object_type_name,
-                            exc,
-                            exc_info=True,
-                        )
+                    except (KeyboardInterrupt, SystemExit):
                         raise
+                    except Exception as exc:
+                        self._record_comparison_error(
+                            phase="child_relation",
+                            subject=self._comparison_subject(new_obj, context),
+                            exception=exc,
+                            severity="recoverable",
+                        )
 
         if child_relations and compare_result.added_items:
             for new_obj in compare_result.added_items:
                 for child_attr, child_cls in child_relations:
-                    slot_new = getattr(new_obj, child_attr, None) or []
-                    if isinstance(slot_new, StoreBackedSequence):
-                        new_children = slot_new
-                    else:
-                       new_children = _ensure_elements_of_type(slot_new, child_cls)
-                    child_context = dict(context or {})
-                    if parent_cls is Cube:
-                        child_context["cube_name"] = getattr(new_obj, "name", "")
-                        if child_cls is Rule:
-                            child_context["rule_collection"] = child_attr
-                    if parent_cls is Dimension:
-                        child_context["dimension_name"] = getattr(new_obj, "name", "")
-                    if parent_cls is Hierarchy:
-                        child_context["hierarchy_name"] = getattr(new_obj, "name", "")
-                    self._compare_with_children([], new_children, child_cls, changeset, mode, context=child_context)
+                    try:
+                        slot_new = getattr(new_obj, child_attr, None) or []
+                        if isinstance(slot_new, StoreBackedSequence):
+                            new_children = slot_new
+                        else:
+                            new_children = _ensure_elements_of_type(slot_new, child_cls)
+                        child_context = dict(context or {})
+                        if parent_cls is Cube:
+                            child_context["cube_name"] = getattr(new_obj, "name", "")
+                            if child_cls is Rule:
+                                child_context["rule_collection"] = child_attr
+                        if parent_cls is Dimension:
+                            child_context["dimension_name"] = getattr(new_obj, "name", "")
+                        if parent_cls is Hierarchy:
+                            child_context["hierarchy_name"] = getattr(new_obj, "name", "")
+                        self._compare_with_children([], new_children, child_cls, changeset, mode, context=child_context)
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception as exc:
+                        self._record_comparison_error(
+                            phase="child_relation",
+                            subject=self._comparison_subject(new_obj, context),
+                            exception=exc,
+                            severity="recoverable",
+                        )
 
         if mode == "full" and child_relations and compare_result.removed_items:
             for old_obj in compare_result.removed_items:
                 for child_attr, child_cls in child_relations:
-                    slot_old = getattr(old_obj, child_attr, None) or []
-                    if isinstance(slot_old, StoreBackedSequence):
-                        old_children = slot_old
-                    else:
-                        old_children = _ensure_elements_of_type(slot_old, child_cls)
-                    child_context = dict(context or {})
-                    if parent_cls is Cube:
-                        child_context["cube_name"] = getattr(old_obj, "name", "")
-                        if child_cls is Rule:
-                            child_context["rule_collection"] = child_attr
-                    if parent_cls is Dimension:
-                        child_context["dimension_name"] = getattr(old_obj, "name", "")
-                    if parent_cls is Hierarchy:
-                        child_context["hierarchy_name"] = getattr(old_obj, "name", "")
-                    self._compare_with_children(slot_old, [], child_cls, changeset, mode, context=child_context)
+                    try:
+                        slot_old = getattr(old_obj, child_attr, None) or []
+                        if isinstance(slot_old, StoreBackedSequence):
+                            old_children = slot_old
+                        else:
+                            old_children = _ensure_elements_of_type(slot_old, child_cls)
+                        child_context = dict(context or {})
+                        if parent_cls is Cube:
+                            child_context["cube_name"] = getattr(old_obj, "name", "")
+                            if child_cls is Rule:
+                                child_context["rule_collection"] = child_attr
+                        if parent_cls is Dimension:
+                            child_context["dimension_name"] = getattr(old_obj, "name", "")
+                        if parent_cls is Hierarchy:
+                            child_context["hierarchy_name"] = getattr(old_obj, "name", "")
+                        self._compare_with_children(slot_old, [], child_cls, changeset, mode, context=child_context)
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception as exc:
+                        self._record_comparison_error(
+                            phase="child_relation",
+                            subject=self._comparison_subject(old_obj, context),
+                            exception=exc,
+                            severity="recoverable",
+                        )
         return compare_result
 
     def _compare_disk_backed_sorted_merge(
@@ -757,15 +893,50 @@ class Comparator:
         reported_processed = 0
 
         logger.info(
-            "Starting %s streaming compare old_size=%d new_size=%d progress_every=%d",
+            "Starting compare phase=%s streaming old_size=%d new_size=%d",
             object_type_name,
             old_total,
             new_total,
-            progress_every,
         )
         stream_total = max(1, old_total + new_total)
         self._begin_collection_progress(label=object_type_name, total_units=stream_total)
         pending_changes: list[Change] = []
+
+        def _enqueue_streaming_change(change_type: ChangeType, obj: Any) -> bool:
+            """Keep an invalid streamed item from aborting unrelated items."""
+            try:
+                self._enqueue_batched_change(
+                    changeset,
+                    pending_changes,
+                    change_type=change_type,
+                    obj=obj,
+                    uri=_resolve_change_uri(obj, context),
+                )
+                return True
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                self._record_comparison_error(
+                    phase="object_change",
+                    subject=self._comparison_subject(obj, context),
+                    exception=exc,
+                    severity="recoverable",
+                )
+                return False
+
+        def _is_streaming_object_in_scope(obj: Any) -> bool:
+            try:
+                return self._is_object_in_scope(obj, context=context)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                self._record_comparison_error(
+                    phase="object_filter",
+                    subject=self._comparison_subject(obj, context),
+                    exception=exc,
+                    severity="recoverable",
+                )
+                return False
 
         def _log_progress(force: bool = False) -> None:
             nonlocal next_log_at, reported_processed
@@ -778,45 +949,20 @@ class Comparator:
                 self._advance_collection_progress(delta, message=f"streaming {object_type_name}")
                 self._advance_compare_progress(delta, message=f"streaming {object_type_name}")
                 reported_processed = current
-            logger.info(
-                "Streaming compare progress for %s old=%d/%d new=%d/%d added=%d removed=%d common=%d",
-                object_type_name,
-                old_seen,
-                old_total,
-                new_seen,
-                new_total,
-                added_c,
-                removed_c,
-                common_c,
-            )
             while current >= next_log_at:
                 next_log_at += progress_every
 
         while old_item is not None or new_item is not None:
             if old_item is None:
-                if self._is_object_in_scope(new_item, context=context):
-                    self._enqueue_batched_change(
-                        changeset,
-                        pending_changes,
-                        change_type=ChangeType.ADD,
-                        obj=new_item,
-                        uri=_resolve_change_uri(new_item, context),
-                    )
-                    added_c += 1
+                if _is_streaming_object_in_scope(new_item):
+                    added_c += _enqueue_streaming_change(ChangeType.ADD, new_item)
                 new_item = next(new_it, None)
                 new_seen += 1
                 _log_progress()
                 continue
             if new_item is None:
-                if mode == 'full' and self._is_object_in_scope(old_item, context=context):
-                    self._enqueue_batched_change(
-                        changeset,
-                        pending_changes,
-                        change_type=ChangeType.REMOVE,
-                        obj=old_item,
-                        uri=_resolve_change_uri(old_item, context),
-                    )
-                    removed_c += 1
+                if mode == 'full' and _is_streaming_object_in_scope(old_item):
+                    removed_c += _enqueue_streaming_change(ChangeType.REMOVE, old_item)
                 old_item = next(old_it, None)
                 old_seen += 1
                 _log_progress()
@@ -824,39 +970,44 @@ class Comparator:
 
             try:
                 key_old = _object_identity(old_item, context=context)
-                key_new = _object_identity(new_item, context=context)
-            except AttributeError as exc:
-                logger.error(
-                    "Objects missing identity fields in %s streaming compare: %s",
-                    object_type_name,
-                    exc,
-                    exc_info=True,
-                )
+            except (KeyboardInterrupt, SystemExit):
                 raise
+            except Exception as exc:
+                self._record_comparison_error(
+                    phase="object_identity",
+                    subject=self._comparison_subject(old_item, context),
+                    exception=exc,
+                    severity="recoverable",
+                )
+                old_item = next(old_it, None)
+                old_seen += 1
+                _log_progress()
+                continue
+            try:
+                key_new = _object_identity(new_item, context=context)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                self._record_comparison_error(
+                    phase="object_identity",
+                    subject=self._comparison_subject(new_item, context),
+                    exception=exc,
+                    severity="recoverable",
+                )
+                new_item = next(new_it, None)
+                new_seen += 1
+                _log_progress()
+                continue
 
             if key_old < key_new:
-                if mode == 'full' and self._is_object_in_scope(old_item, context=context):
-                    self._enqueue_batched_change(
-                        changeset,
-                        pending_changes,
-                        change_type=ChangeType.REMOVE,
-                        obj=old_item,
-                        uri=_resolve_change_uri(old_item, context),
-                    )
-                    removed_c += 1
+                if mode == 'full' and _is_streaming_object_in_scope(old_item):
+                    removed_c += _enqueue_streaming_change(ChangeType.REMOVE, old_item)
                 old_item = next(old_it, None)
                 old_seen += 1
                 _log_progress()
             elif key_old > key_new:
-                if self._is_object_in_scope(new_item, context=context):
-                    self._enqueue_batched_change(
-                        changeset,
-                        pending_changes,
-                        change_type=ChangeType.ADD,
-                        obj=new_item,
-                        uri=_resolve_change_uri(new_item, context),
-                    )
-                    added_c += 1
+                if _is_streaming_object_in_scope(new_item):
+                    added_c += _enqueue_streaming_change(ChangeType.ADD, new_item)
                 new_item = next(new_it, None)
                 new_seen += 1
                 _log_progress()
@@ -866,22 +1017,16 @@ class Comparator:
                     if self._is_object_in_scope(new_item, context=context):
                         objects_equal = equals_fn(old_item, new_item) if equals_fn else old_item == new_item
                         if not objects_equal:
-                            self._enqueue_batched_change(
-                                changeset,
-                                pending_changes,
-                                change_type=ChangeType.MODIFY,
-                                obj=new_item,
-                                uri=_resolve_change_uri(new_item, context),
-                            )
-                except Exception as exc:
-                    logger.error(
-                        "Failed comparing %s '%s': %s",
-                        object_type_name,
-                        key_old,
-                        exc,
-                        exc_info=True,
-                    )
+                            _enqueue_streaming_change(ChangeType.MODIFY, new_item)
+                except (KeyboardInterrupt, SystemExit):
                     raise
+                except Exception as exc:
+                    self._record_comparison_error(
+                        phase="object_comparison",
+                        subject=self._comparison_subject(new_item, context),
+                        exception=exc,
+                        severity="recoverable",
+                    )
                 old_item = next(old_it, None)
                 new_item = next(new_it, None)
                 old_seen += 1
@@ -890,8 +1035,8 @@ class Comparator:
 
         self._flush_batched_changes(changeset, pending_changes)
         _log_progress(force=True)
-        logger.debug(
-            "Diff counts for %s (streaming): added=%d removed=%d common=%d",
+        logger.info(
+            "Completed compare phase=%s streaming added=%d removed=%d common=%d",
             object_type_name,
             added_c,
             removed_c,
@@ -929,19 +1074,33 @@ class Comparator:
             new_list_m = list(new_list)
             local_total_units = max(1, len(old_list_m) + len(new_list_m))
             self._begin_collection_progress(label=object_type_name, total_units=local_total_units)
-            old_map = {
-                _object_identity(obj, context=context): obj
-                for obj in old_list_m
-                if self._is_object_in_scope(obj, context=context)
-            }
-            new_map = {
-                _object_identity(obj, context=context): obj
-                for obj in new_list_m
-                if self._is_object_in_scope(obj, context=context)
-            }
-        except AttributeError as exc:
-            logger.error("Objects missing identity fields in %s comparison: %s", object_type_name, exc, exc_info=True)
+        except (KeyboardInterrupt, SystemExit):
             raise
+        except Exception:
+            # Materialising a collection is a phase-level operation.  The
+            # caller records it as fatal because no safe item boundary exists.
+            raise
+
+        def _build_object_map(items: Iterable[Any]) -> dict[str, Any]:
+            object_map: dict[str, Any] = {}
+            for item in items:
+                try:
+                    if not self._is_object_in_scope(item, context=context):
+                        continue
+                    object_map[_object_identity(item, context=context)] = item
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as exc:
+                    self._record_comparison_error(
+                        phase="object_identity",
+                        subject=self._comparison_subject(item, context),
+                        exception=exc,
+                        severity="recoverable",
+                    )
+            return object_map
+
+        old_map = _build_object_map(old_list_m)
+        new_map = _build_object_map(new_list_m)
 
         new_names = set(new_map.keys())
         old_names = set(old_map.keys())
@@ -949,40 +1108,58 @@ class Comparator:
         added_names = new_names - old_names
         removed_names = old_names - new_names
         common_names = new_names & old_names
-        logger.debug(
-            "Diff counts for %s: added=%d removed=%d common=%d",
-            object_type_name,
-            len(added_names),
-            len(removed_names),
-            len(common_names),
-        )
         pending_changes: list[Change] = []
 
+        added_items: list[Any] = []
         for name in added_names:
-            self._enqueue_batched_change(
-                changeset,
-                pending_changes,
-                change_type=ChangeType.ADD,
-                obj=new_map[name],
-                uri=_resolve_change_uri(new_map[name], context),
-            )
-
-        if mode == 'full':
-            for name in removed_names:
+            new_obj = new_map[name]
+            try:
                 self._enqueue_batched_change(
                     changeset,
                     pending_changes,
-                    change_type=ChangeType.REMOVE,
-                    obj=old_map[name],
-                    uri=_resolve_change_uri(old_map[name], context),
+                    change_type=ChangeType.ADD,
+                    obj=new_obj,
+                    uri=_resolve_change_uri(new_obj, context),
                 )
+                added_items.append(new_obj)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                self._record_comparison_error(
+                    phase="object_change",
+                    subject=self._comparison_subject(new_obj, context),
+                    exception=exc,
+                    severity="recoverable",
+                )
+
+        removed_items: list[Any] = []
+        if mode == 'full':
+            for name in removed_names:
+                old_obj = old_map[name]
+                try:
+                    self._enqueue_batched_change(
+                        changeset,
+                        pending_changes,
+                        change_type=ChangeType.REMOVE,
+                        obj=old_obj,
+                        uri=_resolve_change_uri(old_obj, context),
+                    )
+                    removed_items.append(old_obj)
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as exc:
+                    self._record_comparison_error(
+                        phase="object_change",
+                        subject=self._comparison_subject(old_obj, context),
+                        exception=exc,
+                        severity="recoverable",
+                    )
 
         matched_pairs: dict[str, tuple[Any, Any]] = {}
         for name in common_names:
             try:
                 old_obj = old_map[name]
                 new_obj = new_map[name]
-                matched_pairs[name] = (old_obj, new_obj)
                 objects_equal = equals_fn(old_obj, new_obj) if equals_fn else old_obj == new_obj
                 if not objects_equal:
                     self._enqueue_batched_change(
@@ -992,9 +1169,16 @@ class Comparator:
                         obj=new_obj,
                         uri=_resolve_change_uri(new_obj, context),
                     )
-            except Exception as exc:
-                logger.error("Failed comparing %s '%s': %s", object_type_name, name, exc, exc_info=True)
+                matched_pairs[name] = (old_obj, new_obj)
+            except (KeyboardInterrupt, SystemExit):
                 raise
+            except Exception as exc:
+                self._record_comparison_error(
+                    phase="object_comparison",
+                    subject=self._comparison_subject(new_map[name], context),
+                    exception=exc,
+                    severity="recoverable",
+                )
 
         self._flush_batched_changes(changeset, pending_changes)
 
@@ -1004,6 +1188,6 @@ class Comparator:
 
         return _CompareObjectListsResult(
             matched_pairs=matched_pairs,
-            added_items=[new_map[name] for name in added_names],
-            removed_items=[old_map[name] for name in removed_names],
+            added_items=added_items,
+            removed_items=removed_items,
         )

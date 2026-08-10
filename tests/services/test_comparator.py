@@ -13,6 +13,129 @@ class TestComparator:
     def _bodies_by(change_set: list[Change], body_type: type) -> list:
         return [c.body for c in change_set if isinstance(c.body, body_type)]
 
+    def test_compare_returns_diagnostics_and_keeps_independent_changes(self):
+        class ExplodingProcess(Process):
+            def __eq__(self, other):
+                raise RuntimeError("broken process comparison")
+
+        bad_old = ExplodingProcess("Broken", True, "Broken.ti", "None", [], [], None)
+        bad_new = ExplodingProcess("Broken", True, "Broken.ti", "None", [], [], None)
+        good_old = make_process(name="Good", parameters=[])
+        good_new = make_process(name="Good", parameters=[{"name": "p", "value": "new"}])
+        reported = []
+
+        result = Comparator().compare(
+            Model(cubes=[], dimensions=[], processes=[bad_old, good_old], chores=[]),
+            Model(cubes=[], dimensions=[], processes=[bad_new, good_new], chores=[]),
+            error_callback=reported.append,
+        )
+        changeset, errors = result
+
+        assert isinstance(result, tuple)
+        assert any(
+            change.object_type == ObjectType.PROCESS
+            and change.change_type == ChangeType.MODIFY
+            and change.body.name == "Good"
+            for change in changeset.changes
+        )
+        assert [(error.workflow, error.phase, error.subject, error.exception_type, error.severity) for error in errors] == [
+            ("compare", "object_comparison", "Processes('Broken')", "RuntimeError", "recoverable"),
+        ]
+        assert reported == errors
+
+    def test_compare_reports_diagnostics_in_stable_callback_order(self):
+        class ExplodingProcess(Process):
+            def __eq__(self, other):
+                raise RuntimeError("broken process comparison")
+
+        old_processes = [
+            ExplodingProcess("Second", True, "Second.ti", "None", [], [], None),
+            ExplodingProcess("First", True, "First.ti", "None", [], [], None),
+        ]
+        new_processes = [
+            ExplodingProcess("Second", True, "Second.ti", "None", [], [], None),
+            ExplodingProcess("First", True, "First.ti", "None", [], [], None),
+        ]
+        reported = []
+
+        _, errors = Comparator().compare(
+            Model(cubes=[], dimensions=[], processes=old_processes, chores=[]),
+            Model(cubes=[], dimensions=[], processes=new_processes, chores=[]),
+            error_callback=reported.append,
+        )
+
+        assert [error.subject for error in errors] == ["Processes('First')", "Processes('Second')"]
+        assert reported == errors
+
+    def test_compare_keeps_diagnostic_when_error_callback_fails(self, caplog):
+        class ExplodingProcess(Process):
+            def __eq__(self, other):
+                raise RuntimeError("broken process comparison")
+
+        old_process = ExplodingProcess("Broken", True, "Broken.ti", "None", [], [], None)
+        new_process = ExplodingProcess("Broken", True, "Broken.ti", "None", [], [], None)
+
+        def failing_callback(_error):
+            raise RuntimeError("callback failure")
+
+        caplog.set_level("DEBUG")
+        _, errors = Comparator().compare(
+            Model(cubes=[], dimensions=[], processes=[old_process], chores=[]),
+            Model(cubes=[], dimensions=[], processes=[new_process], chores=[]),
+            error_callback=failing_callback,
+        )
+
+        assert len(errors) == 1
+        assert "Error callback failed while reporting compare/object_comparison" in caplog.text
+
+    def test_compare_continues_after_a_top_level_phase_failure(self, monkeypatch):
+        comparator = Comparator()
+        original_compare = comparator._compare_with_children
+
+        def fail_cube_phase(old_rows, new_rows, parent_cls, *args, **kwargs):
+            if parent_cls is Cube:
+                raise RuntimeError("cube collection unavailable")
+            return original_compare(old_rows, new_rows, parent_cls, *args, **kwargs)
+
+        monkeypatch.setattr(comparator, "_compare_with_children", fail_cube_phase)
+        old_process = make_process(name="Good", parameters=[])
+        new_process = make_process(name="Good", parameters=[{"name": "p", "value": "new"}])
+
+        changeset, errors = comparator.compare(
+            Model(cubes=[], dimensions=[], processes=[old_process], chores=[]),
+            Model(cubes=[], dimensions=[], processes=[new_process], chores=[]),
+        )
+
+        assert any(change.object_type == ObjectType.PROCESS for change in changeset.changes)
+        assert [(error.phase, error.subject, error.severity) for error in errors] == [
+            ("object_phase", "Cube", "fatal"),
+        ]
+
+    def test_compare_records_child_relation_error_and_keeps_other_relations(self):
+        class ExplodingIterable:
+            def __iter__(self):
+                raise RuntimeError("views cannot be read")
+
+        broken_old = make_cube(name="Broken")
+        broken_new = make_cube(name="Broken")
+        broken_new.views = ExplodingIterable()
+        good_old = make_cube(name="Good")
+        good_new = make_cube(name="Good")
+        good_new.views = [make_mdx_view(name="AddedView")]
+
+        changeset, errors = Comparator().compare(
+            Model(cubes=[broken_old, good_old], dimensions=[], processes=[], chores=[], total_object_count=2),
+            Model(cubes=[broken_new, good_new], dimensions=[], processes=[], chores=[], total_object_count=2),
+        )
+
+        assert any(
+            change.object_type == ObjectType.MDX_VIEW and change.body.name == "AddedView"
+            for change in changeset.changes
+        )
+        assert [(error.phase, error.subject, error.severity) for error in errors] == [
+            ("child_relation", "Cubes('Broken')", "recoverable"),
+        ]
+
 
     def test_objects_equal(self, objects_equal_data):
         obj1, obj2, shallow_fn, expect_strict_equal = objects_equal_data
@@ -738,8 +861,8 @@ class TestComparator:
         caplog.set_level("INFO")
         changeset = Comparator().compare(model_old, model_new, mode="full")
         assert any(c.object_type == ObjectType.ELEMENT and c.change_type == ChangeType.ADD for c in changeset.changes)
-        assert "Starting Element streaming compare old_size=0" in caplog.text
-        assert "Starting Edge streaming compare old_size=0" in caplog.text
+        assert "Starting compare phase=Element streaming old_size=0" in caplog.text
+        assert "Starting compare phase=Edge streaming old_size=0" in caplog.text
 
     def test_comparator_detects_hierarchy_sort_metadata_change(self):
         h_old = Hierarchy(name="H1", elements=[], edges=[], subsets=[])
@@ -908,7 +1031,7 @@ class TestComparator:
         model2 = build_mock_model()
         sink = _CaptureSink()
 
-        changeset = Comparator().compare(
+        changeset, errors = Comparator().compare(
             model1,
             model2,
             mode="full",
@@ -916,6 +1039,7 @@ class TestComparator:
         )
 
         assert isinstance(changeset, Changeset)
+        assert errors == []
         assert any(event.scope.value == "TOTAL" and event.kind.value == "start" for event in sink.events)
         assert any(event.scope.value == "TOTAL" and event.kind.value == "update" for event in sink.events)
 

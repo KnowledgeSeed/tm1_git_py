@@ -265,7 +265,8 @@ class TestChangeset:
         model_new, errors_new = deserialize_model(str(test_model_dir_diff))
         comparator = Comparator()
 
-        changeset = comparator.compare(model_old, model_new)
+        changeset, errors = comparator.compare(model_old, model_new)
+        assert not errors, errors
 
         # Patch deletes so we can inspect call order
         mock_delete = mocker.patch("tm1_git_py.services.apply.delete_object")
@@ -301,7 +302,8 @@ class TestChangeset:
         model_new, errors_new = deserialize_model(str(test_model_dir_diff))
         comparator = Comparator()
 
-        changeset = comparator.compare(model_old, model_new)
+        changeset, errors = comparator.compare(model_old, model_new)
+        assert not errors, errors
 
         # Patch creates so we can inspect call order
         mock_delete = mocker.patch("tm1_git_py.services.apply.delete_object")
@@ -336,7 +338,8 @@ class TestChangeset:
         model_new, errors_new = deserialize_model(str(test_model_dir_diff))
         comparator = Comparator()
 
-        changeset = comparator.compare(model_old, model_new)
+        changeset, errors = comparator.compare(model_old, model_new)
+        assert not errors, errors
 
         # Patch update so we can inspect call order
         mock_delete = mocker.patch("tm1_git_py.services.apply.delete_object")
@@ -1019,7 +1022,8 @@ class TestChangeset:
         model_new, errors_new = deserialize_model(str(test_model_dir_diff))
         comparator = tm1_git_py.Comparator()
 
-        changeset_compared = comparator.compare(model_old, model_new)
+        changeset_compared, errors = comparator.compare(model_old, model_new)
+        assert not errors, errors
         export_path = tmp_path / "changes_exported.yaml"
         changeset_compared.export(file_path=export_path)
 
