@@ -5,10 +5,12 @@ import queue
 import shutil
 import sys
 import threading
+import tempfile
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 import tracemalloc
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
+from uuid import uuid4
 
 from TM1py import TM1Service
 
@@ -32,7 +34,10 @@ from tm1_git_py.reporting.progress_reporting import (
     ProgressSink,
     TqdmProgressSink,
 )
-from tm1_git_py.reporting.error_reporting import WorkflowError
+from tm1_git_py.reporting.error_reporting import (
+    WorkflowError,
+    workflow_error_from_exception,
+)
 from tm1_git_py.services.changeset import import_changeset
 from tm1_git_py.services.comparator import Comparator
 from tm1_git_py.services.deserializer import deserialize_model
@@ -44,6 +49,59 @@ from tm1_git_py import __version__
 logger = logging.getLogger(__name__)
 
 
+class _CliDiagnosticCollector:
+    """Collect and format workflow diagnostics in the CLI coordinator.
+
+    Service workers return diagnostics as ordinary result data.  This collector
+    deliberately stays in the command process and serves as the external error
+    callback for coordinator-local workflows.
+    """
+
+    def __init__(self) -> None:
+        self.errors: list[WorkflowError] = []
+        self._reported_error_ids: set[int] = set()
+
+    def __call__(self, error: WorkflowError) -> None:
+        self.errors.append(error)
+        self._reported_error_ids.add(id(error))
+
+    def extend(self, errors: Iterable[WorkflowError]) -> list[WorkflowError]:
+        added = list(errors)
+        for error in added:
+            if id(error) not in self._reported_error_ids:
+                self.errors.append(error)
+                self._reported_error_ids.add(id(error))
+        return added
+
+    def log_summary(
+        self,
+        phase: str,
+        errors: Iterable[WorkflowError],
+    ) -> None:
+        phase_errors = list(errors)
+        if not phase_errors:
+            logger.info("Workflow diagnostic summary | phase=%s total=0", phase)
+            return
+
+        recoverable_count = sum(
+            error.severity == "recoverable" for error in phase_errors
+        )
+        fatal_count = len(phase_errors) - recoverable_count
+        logger.warning(
+            "Workflow diagnostic summary | phase=%s total=%d recoverable=%d fatal=%d",
+            phase,
+            len(phase_errors),
+            recoverable_count,
+            fatal_count,
+        )
+        for error in phase_errors:
+            logger.warning("Workflow diagnostic | %s", error.to_dict())
+
+    @property
+    def has_errors(self) -> bool:
+        return bool(self.errors)
+
+
 def _normalize_max_workers(value: Any) -> int | None:
     if value is None:
         return None
@@ -51,6 +109,48 @@ def _normalize_max_workers(value: Any) -> int | None:
         return max(1, int(value))
     except (TypeError, ValueError):
         return None
+
+
+def _resolve_cli_log_level(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser | None = None,
+) -> str:
+    """Normalize the level option and its deprecated compatibility alias."""
+
+    requested_level = getattr(args, "log_level", None)
+    if bool(getattr(args, "debug", False)):
+        if requested_level not in (None, "debug"):
+            message = "--debug conflicts with --log-level info"
+            if parser is not None:
+                parser.error(message)
+            raise ValueError(message)
+        return "debug"
+    return requested_level or "info"
+
+
+def _debug_progress_enabled(args: argparse.Namespace) -> bool:
+    return _resolve_cli_log_level(args) == "debug"
+
+
+def _create_cli_progress_sink(
+    args: argparse.Namespace,
+    *,
+    worker_count: int | None,
+    leave: bool,
+) -> tuple[TqdmProgressSink, ProgressSink]:
+    """Create the total progress UI and optional debug progress log adapter."""
+
+    debug_progress = _debug_progress_enabled(args)
+    tqdm_sink = TqdmProgressSink(
+        worker_count=worker_count,
+        base_position=0,
+        leave=leave,
+        thread_tracing_enabled=debug_progress,
+    )
+    sinks: list[ProgressSink] = [tqdm_sink]
+    if debug_progress:
+        sinks.append(LoggingProgressSink(logger))
+    return tqdm_sink, sinks[0] if len(sinks) == 1 else CompositeProgressSink(sinks)
 
 
 def _split_compare_workers(max_workers: int) -> tuple[int, int]:
@@ -97,6 +197,41 @@ def _deserialize_model_worker(
     return model, errors
 
 
+def _collect_deserialize_future(
+    future: Any,
+    *,
+    model_path: Path,
+    side: str,
+    diagnostic_collector: _CliDiagnosticCollector,
+) -> Model | None:
+    """Resolve one deserialization future in the parent process.
+
+    Child processes return only models and serializable diagnostics.  A failed
+    future is converted here so pool exceptions remain contextual diagnostics
+    rather than bypassing the CLI's output policy.
+    """
+
+    try:
+        model, worker_errors = future.result()
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        error = workflow_error_from_exception(
+            workflow="deserialize",
+            phase="process_pool",
+            subject=str(model_path),
+            exception=exc,
+            severity="fatal",
+        )
+        diagnostic_collector(error)
+        diagnostic_collector.log_summary(f"{side}-deserialize", [error])
+        return None
+
+    phase_errors = diagnostic_collector.extend(worker_errors)
+    diagnostic_collector.log_summary(f"{side}-deserialize", phase_errors)
+    return model
+
+
 def _consume_compare_progress_events(
     progress_queue: Any,
     source_sink: ProgressSink,
@@ -129,17 +264,64 @@ def _consume_compare_progress_events(
             target_sink.on_event(event)
 
 
-def _prepare_model_folder(model_folder: str, overwrite: bool = False):
-    model_path = Path(model_folder)
-    if model_path.exists() and model_path.is_dir():
-        if not overwrite:
-            logger.error(
-                "Model folder '%s' already exists. Use --overwrite flag to clear and overwrite.",
-                model_folder,
-            )
-            sys.exit(1)
-        logger.info("Clearing existing model folder: %s", model_folder)
-        shutil.rmtree(model_folder)
+def _validate_export_destination(output_path: Path, overwrite: bool) -> bool:
+    """Confirm publication is permitted without touching existing output."""
+
+    if not output_path.exists():
+        return True
+    if not output_path.is_dir():
+        logger.error("Model output path is not a directory: %s", output_path)
+        return False
+    if not overwrite:
+        logger.error(
+            "Model folder '%s' already exists. Use --overwrite to replace it after a successful export.",
+            output_path,
+        )
+        return False
+    return True
+
+
+def _create_export_staging_directory(output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return Path(
+        tempfile.mkdtemp(
+            prefix=f".{output_path.name}.tm1gitpy-staging-",
+            dir=output_path.parent,
+        )
+    )
+
+
+def _promote_export_staging_directory(
+    staging_path: Path,
+    output_path: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    """Publish a staged export while preserving existing output on failure."""
+
+    if not output_path.exists():
+        staging_path.replace(output_path)
+        return
+
+    if not overwrite:
+        raise FileExistsError(f"Model folder already exists: {output_path}")
+    if not output_path.is_dir():
+        raise NotADirectoryError(f"Model output path is not a directory: {output_path}")
+
+    backup_path = output_path.with_name(
+        f".{output_path.name}.tm1gitpy-backup-{uuid4().hex}"
+    )
+    output_path.replace(backup_path)
+    try:
+        staging_path.replace(output_path)
+    except Exception:
+        backup_path.replace(output_path)
+        raise
+
+    try:
+        shutil.rmtree(backup_path)
+    except OSError:
+        logger.warning("Could not remove previous export backup: %s", backup_path)
 
 
 def _filter_path_from_arg(filter_arg: str) -> Path:
@@ -240,20 +422,27 @@ def _add_common_cli_options(p: argparse.ArgumentParser) -> None:
         help="Enable console log output in addition to progress UI",
     )
     p.add_argument(
+        "--log-level",
+        choices=("info", "debug"),
+        default=None,
+        help="Application log level (default: info)",
+    )
+    p.add_argument(
         "--debug",
         action="store_true",
-        help="Enable detailed worker/thread progress bars in the terminal progress UI",
+        help="Deprecated alias for --log-level debug; also enables worker tracing progress rows",
     )
 
 
-def _cmd_export(args: argparse.Namespace) -> None:
+def _cmd_export(args: argparse.Namespace) -> int:
     config = TM1ServersConfig()
     config.load()
     tm1_service = _tm1_connection_from_config(config, args.server)
     model_output_folder = args.model_output_folder or "export"
     model_output_path = Path(model_output_folder).expanduser().resolve()
-
-    _prepare_model_folder(model_output_folder, args.overwrite)
+    diagnostic_collector = _CliDiagnosticCollector()
+    if not _validate_export_destination(model_output_path, args.overwrite):
+        return 1
 
     filter_rules = _resolve_filter_rules(args.filter)
 
@@ -263,60 +452,132 @@ def _cmd_export(args: argparse.Namespace) -> None:
         raise ValueError("model_id must not be empty")
     requested_max_workers = _normalize_max_workers(args.max_workers)
 
-    debug_progress = bool(getattr(args, "debug", False))
-    tqdm_sink = TqdmProgressSink(worker_count=requested_max_workers, base_position=0, leave=True, thread_tracing_enabled=debug_progress)
-    sink_list: list[ProgressSink] = [tqdm_sink]
-    if bool(args.log_file):
-        sink_list.append(LoggingProgressSink(logger))
-    main_sink: ProgressSink = (
-        sink_list[0] if len(sink_list) == 1 else CompositeProgressSink(sink_list)
+    tqdm_sink, main_sink = _create_cli_progress_sink(
+        args,
+        worker_count=requested_max_workers,
+        leave=True,
     )
-    exported_model, export_errors = export(
-        tm1_service,
-        model_id=model_id,
-        filter_rules=filter_rules,
-        progress_sink=main_sink,
-        max_workers=requested_max_workers,
-    )
-    tqdm_sink.reset_bars()
+    staging_path: Path | None = None
+    try:
+        try:
+            staging_path = _create_export_staging_directory(model_output_path)
+        except Exception as exc:
+            error = workflow_error_from_exception(
+                workflow="export",
+                phase="staging",
+                subject=str(model_output_path),
+                exception=exc,
+                severity="fatal",
+            )
+            diagnostic_collector(error)
+            diagnostic_collector.log_summary("staging", [error])
+            return 1
 
-    if export_errors:
-        logger.warning("Export errors encountered total=%d", len(export_errors))
-    else:
-        logger.info("Export completed successfully with no errors")
+        exported_model: Model | None = None
+        try:
+            exported_model, export_errors = export(
+                tm1_service,
+                model_id=model_id,
+                filter_rules=filter_rules,
+                progress_sink=main_sink,
+                max_workers=requested_max_workers,
+                error_callback=diagnostic_collector,
+            )
+            phase_errors = diagnostic_collector.extend(export_errors)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            error = workflow_error_from_exception(
+                workflow="export",
+                phase="export",
+                subject=model_id,
+                exception=exc,
+                severity="fatal",
+            )
+            diagnostic_collector(error)
+            phase_errors = [error]
+        finally:
+            tqdm_sink.reset_bars()
+        diagnostic_collector.log_summary("export", phase_errors)
 
-    serialize_model(exported_model, model_output_folder, progress_sink=main_sink, max_workers=requested_max_workers)
-    
-    logger.info("Model serialized to: %s", model_output_folder)
+        if exported_model is not None:
+            try:
+                serialization_errors = serialize_model(
+                    exported_model,
+                    str(staging_path),
+                    progress_sink=main_sink,
+                    max_workers=requested_max_workers,
+                    error_callback=diagnostic_collector,
+                )
+                phase_errors = diagnostic_collector.extend(serialization_errors)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                error = workflow_error_from_exception(
+                    workflow="serialize",
+                    phase="serialize",
+                    subject=str(staging_path),
+                    exception=exc,
+                    severity="fatal",
+                )
+                diagnostic_collector(error)
+                phase_errors = [error]
+            diagnostic_collector.log_summary("serialize", phase_errors)
+
+        if diagnostic_collector.has_errors:
+            logger.warning("Model output was not published because diagnostics were collected")
+            return 1
+
+        try:
+            _promote_export_staging_directory(
+                staging_path,
+                model_output_path,
+                overwrite=args.overwrite,
+            )
+        except Exception as exc:
+            error = workflow_error_from_exception(
+                workflow="export",
+                phase="publish",
+                subject=str(model_output_path),
+                exception=exc,
+                severity="fatal",
+            )
+            diagnostic_collector(error)
+            diagnostic_collector.log_summary("publish", [error])
+            return 1
+
+        logger.info("Model serialized to: %s", model_output_path)
+        return 0
+    finally:
+        try:
+            main_sink.close()
+        finally:
+            if staging_path is not None and staging_path.exists():
+                shutil.rmtree(staging_path, ignore_errors=True)
 
 
-def _cmd_compare(args: argparse.Namespace) -> None:
+def _cmd_compare(args: argparse.Namespace) -> int:
     source = Path(args.source).expanduser().resolve()
     target = Path(args.target).expanduser().resolve()
     if not source.is_dir():
         logger.error("Source model path is not a directory: %s", source)
-        sys.exit(1)
+        return 1
     if not target.is_dir():
         logger.error("Target model path is not a directory: %s", target)
-        sys.exit(1)
+        return 1
 
     changeset = None
+    tqdm_sink: TqdmProgressSink | None = None
+    diagnostic_collector = _CliDiagnosticCollector()
     try:
         requested_max_workers = _normalize_max_workers(args.max_workers)
         
-        tqdm_sink = TqdmProgressSink(
+        tqdm_sink, queuing_progress_sink = _create_cli_progress_sink(
+            args,
             worker_count=requested_max_workers,
-            base_position=0,
             leave=False,
-            thread_tracing_enabled=bool(getattr(args, "debug", False)),
         )
         source_workers, target_workers = _split_compare_workers(requested_max_workers)
-        progress_sinks: list[ProgressSink] = [tqdm_sink]
-        if bool(args.log_file):
-            progress_sinks.append(LoggingProgressSink(logger))
-        queuing_progress_sink: ProgressSink = (
-            progress_sinks[0] if len(progress_sinks) == 1 else CompositeProgressSink(progress_sinks)
-        )
 
         multi_process_progress_manager: Optional[MultiProcessProgressManager] = None
         multi_process_progress_manager = MultiProcessProgressManager(queuing_progress_sink)
@@ -336,16 +597,25 @@ def _cmd_compare(args: argparse.Namespace) -> None:
             # is picklable: ``StoreBackedSequence.__getstate__`` drops the live
             # ``ModelStore`` and the receiving process re-acquires it through
             # ``ModelStore.for_db_path`` lazily on first access.
-            model_source, err_source = source_future.result()
-            model_target, err_target = target_future.result()
+            model_source = _collect_deserialize_future(
+                source_future,
+                model_path=source,
+                side="source",
+                diagnostic_collector=diagnostic_collector,
+            )
+            model_target = _collect_deserialize_future(
+                target_future,
+                model_path=target,
+                side="target",
+                diagnostic_collector=diagnostic_collector,
+            )
 
             tqdm_sink.reset_bars()
-
-            if err_source:
-                logger.warning("Source deserialization reported %d error(s)", len(err_source))
             logger.info("Loading target model from %s", target)
-            if err_target:
-                logger.warning("Target deserialization reported %d error(s)", len(err_target))
+
+            if model_source is None or model_target is None:
+                logger.warning("Comparison was skipped because a model could not be deserialized")
+                return 1
 
             extra_filter = _resolve_filter_rules(args.filter_rules)
 
@@ -357,9 +627,10 @@ def _cmd_compare(args: argparse.Namespace) -> None:
                 mode=args.mode,
                 filter_rules=extra_filter,
                 progress_sink=queuing_progress_sink,
+                error_callback=diagnostic_collector,
             )
-            if compare_errors:
-                logger.warning("Comparison reported %d error(s)", len(compare_errors))
+            phase_errors = diagnostic_collector.extend(compare_errors)
+            diagnostic_collector.log_summary("compare", phase_errors)
         
         except KeyboardInterrupt:
             if pool is not None:
@@ -372,6 +643,10 @@ def _cmd_compare(args: argparse.Namespace) -> None:
                 pool = None
             multi_process_progress_manager.close()
 
+        if diagnostic_collector.has_errors:
+            logger.warning("Changeset output was not written because diagnostics were collected")
+            return 1
+
         out = args.output
         if not out:
             out = "changeset.yaml" if args.format == "yaml" else "changeset.json"
@@ -383,9 +658,12 @@ def _cmd_compare(args: argparse.Namespace) -> None:
             logger.info("Wrote JSON changeset (%d change(s)) to %s", len(changeset.changes), output_path)
         else:
             logger.info("Wrote YAML changeset (%d change(s)) to %s", len(changeset.changes), output_path)
+        return 0
     finally:
         if changeset is not None:
             changeset.close()
+        if tqdm_sink is not None:
+            tqdm_sink.close()
 
 
 def _cmd_apply(args: argparse.Namespace) -> None:
@@ -398,18 +676,10 @@ def _cmd_apply(args: argparse.Namespace) -> None:
     changeset = import_changeset(changeset_path)
 
     status_dir = Path(args.status_dir).expanduser().resolve() if args.status_dir else None
-    apply_sinks: list[ProgressSink] = [
-        TqdmProgressSink(
-            base_position=0,
-            worker_count=1,
-            leave=False,
-            thread_tracing_enabled=bool(getattr(args, "debug", False)),
-        )
-    ]
-    if bool(args.log_file):
-        apply_sinks.append(LoggingProgressSink(logger))
-    apply_progress_sink: ProgressSink = (
-        apply_sinks[0] if len(apply_sinks) == 1 else CompositeProgressSink(apply_sinks)
+    _, apply_progress_sink = _create_cli_progress_sink(
+        args,
+        worker_count=1,
+        leave=False,
     )
     try:
         ok, errors = changeset.apply(
@@ -437,17 +707,16 @@ def _cmd_changeset_filter(args: argparse.Namespace) -> None:
 
     filter_rules = _load_filter_rules(args.filter_rules)
     changeset = import_changeset(changeset_path)
-    tqdm_sink = TqdmProgressSink(
+    tqdm_sink, progress_sink = _create_cli_progress_sink(
+        args,
         worker_count=1,
-        base_position=0,
         leave=False,
-        thread_tracing_enabled=bool(getattr(args, "debug", False)),
     )
     try:
         toggled_count = changeset.filter(filter_rules)
-        changeset.export(changeset_path, progress_sink=tqdm_sink)
+        changeset.export(changeset_path, progress_sink=progress_sink)
     finally:
-        tqdm_sink.close()
+        progress_sink.close()
         changeset.close()
     logger.info(
         "Applied changeset filter rules and toggled apply for %d change(s): %s",
@@ -592,20 +861,27 @@ def main():
     p_changeset_filter.set_defaults(handler=_cmd_changeset_filter)
 
     args = parser.parse_args()
+    args.log_level = _resolve_cli_log_level(args, parser)
     setup_logging(
-        "DEBUG" if bool(getattr(args, "debug", False)) else None,
-        enable_console=bool(getattr(args, "console_logs", False)),
+        args.log_level.upper(),
+        enable_console=(
+            bool(getattr(args, "console_logs", False))
+            or args.log_level == "debug"
+        ),
         log_file=getattr(args, "log_file", None),
         command_name=getattr(args, "command", None),
     )
+    if bool(getattr(args, "debug", False)):
+        logger.warning("--debug is deprecated; use --log-level debug")
     logger.info("Command started: %s", args.command)
     try:
-        args.handler(args)
+        exit_code = args.handler(args)
     except KeyboardInterrupt:
         logger.warning("Command interrupted by user")
-        sys.exit(130)
+        return 130
     logger.info("Command finished: %s", args.command)
+    return 0 if exit_code is None else exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

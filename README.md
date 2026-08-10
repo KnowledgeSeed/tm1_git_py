@@ -285,7 +285,9 @@ Commands:
 Shared options (all commands):
   --log-file PATH  Optional log file path (or directory for timestamped logs)
   --console-logs   Enable console log output in addition to progress UI
-  --debug          Enable detailed worker/thread progress bars
+  --log-level {info,debug}
+                    Application log level (default: info)
+  --debug          Deprecated alias for --log-level debug
 
 export:
   -s, --server SERVER
@@ -315,9 +317,17 @@ changset-filter / changeset-filter:
   --filter-rules RULES_OR_FILE
 ```
 
-Logging defaults to `INFO`. You can also set `TM1GITPY_LOG_LEVEL` in the environment. Pass `--debug` to set the log level to `DEBUG` for that run.
+Logging defaults to `INFO`. Use `--log-level debug` to include `DEBUG`
+progress records through the configured console or file handler; `--debug`
+remains a deprecated compatibility alias. `--debug --log-level info` is
+rejected because the options conflict.
 
-Progress output shows a total progress bar by default. Pass `--debug` to also render detailed per-worker/thread progress bars.
+Progress output shows a total progress bar at both levels. Debug level also
+renders detailed per-worker/thread rows for tracing progress; those rows are
+not a separate debugging channel. The debug progress/log callback is enabled
+even without `--log-file` and configures console logs automatically. At info
+level, pass `--console-logs` to display application logs alongside the terminal
+progress UI, or use `--log-file` to persist logs at either level.
 
 Worker counts are split into two worker types:
 - `cpu-worker`: process-based workers used for CPU-bound work such as content hashing.

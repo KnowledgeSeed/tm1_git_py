@@ -457,11 +457,14 @@ class TestExporter:
 
         def fake_export(*args, **kwargs):
             captured_export_kwargs.update(kwargs)
-            return fake_model, {}
+            return fake_model, []
+
+        def fake_serialize(model, path, **kwargs):
+            serialized.append((model, path, kwargs))
+            return []
 
         monkeypatch.setattr(main_module, "TM1ServersConfig", lambda: mock.Mock(load=lambda: None))
         monkeypatch.setattr(main_module, "_tm1_connection_from_config", lambda *args, **kwargs: mock.Mock())
-        monkeypatch.setattr(main_module, "_prepare_model_folder", lambda *args, **kwargs: None)
         monkeypatch.setattr(main_module, "_load_filter_rules", lambda *args, **kwargs: [])
         monkeypatch.setattr(main_module.ModelStore, "for_model_id", classmethod(lambda cls, model_id: mock.Mock()))
         monkeypatch.setattr(main_module, "TqdmProgressSink", mock.Mock())
@@ -469,7 +472,7 @@ class TestExporter:
         monkeypatch.setattr(
             main_module,
             "serialize_model",
-            lambda model, path, **kwargs: serialized.append((model, path, kwargs)),
+            fake_serialize,
         )
 
         output_dir = str(tmp_path / "out")
@@ -483,14 +486,73 @@ class TestExporter:
             debug=False,
         )
 
-        main_module._cmd_export(args)
+        assert main_module._cmd_export(args) == 0
 
         assert "serialize" not in captured_export_kwargs
         assert captured_export_kwargs["max_workers"] == 1
+        assert callable(captured_export_kwargs["error_callback"])
         assert main_module.TqdmProgressSink.call_args_list == [
             mock.call(worker_count=1, base_position=0, leave=True, thread_tracing_enabled=False),
         ]
-        assert serialized == [(fake_model, output_dir, {"progress_sink": mock.ANY, "max_workers": 1})]
+        assert serialized[0][0] is fake_model
+        assert Path(serialized[0][1]).name.startswith(".out.tm1gitpy-staging-")
+        assert serialized[0][2] == {
+            "progress_sink": mock.ANY,
+            "max_workers": 1,
+            "error_callback": mock.ANY,
+        }
+        assert Path(output_dir).is_dir()
+
+    def test_cmd_export_discards_staging_and_preserves_existing_output_on_diagnostics(
+        self,
+        monkeypatch,
+        tmp_path,
+        caplog,
+    ):
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+        previous_file = output_dir / "previous.txt"
+        previous_file.write_text("keep me", encoding="utf-8")
+        fake_model = Model(cubes=[], dimensions=[], processes=[], chores=[], model_id="out")
+        error = WorkflowError(
+            workflow="export",
+            phase="dimensions",
+            subject="Dimensions('Products')",
+            exception_type="RuntimeError",
+            message="could not load hierarchy",
+            severity="recoverable",
+        )
+
+        def fake_export(*args, **kwargs):
+            kwargs["error_callback"](error)
+            return fake_model, [error]
+
+        def fake_serialize(_model, path, **_kwargs):
+            Path(path, "new.txt").write_text("partial", encoding="utf-8")
+            return []
+
+        monkeypatch.setattr(main_module, "TM1ServersConfig", lambda: mock.Mock(load=lambda: None))
+        monkeypatch.setattr(main_module, "_tm1_connection_from_config", lambda *args, **kwargs: mock.Mock())
+        monkeypatch.setattr(main_module, "_load_filter_rules", lambda *args, **kwargs: [])
+        monkeypatch.setattr(main_module, "TqdmProgressSink", mock.Mock())
+        monkeypatch.setattr(main_module, "export", fake_export)
+        monkeypatch.setattr(main_module, "serialize_model", fake_serialize)
+        args = types.SimpleNamespace(
+            server="server",
+            model_output_folder=str(output_dir),
+            overwrite=True,
+            filter=None,
+            max_workers=1,
+            log_file=None,
+            debug=False,
+        )
+
+        assert main_module._cmd_export(args) == 1
+
+        assert previous_file.read_text(encoding="utf-8") == "keep me"
+        assert not (output_dir / "new.txt").exists()
+        assert not list(tmp_path.glob(".out.tm1gitpy-staging-*"))
+        assert caplog.text.count("Workflow diagnostic |") == 1
 
     def test_compare_worker_split_helper(self):
         assert main_module._split_compare_workers(8) == (4, 4)

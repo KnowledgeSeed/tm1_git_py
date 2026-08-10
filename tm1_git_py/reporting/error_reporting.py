@@ -48,6 +48,19 @@ class WorkflowError:
                 "WorkflowError severity must be 'recoverable' or 'fatal'."
             )
 
+    def to_dict(self) -> dict[str, str | None]:
+        """Return a stable, JSON-safe representation for callers and the CLI."""
+
+        return {
+            "workflow": self.workflow,
+            "phase": self.phase,
+            "subject": self.subject,
+            "exception_type": self.exception_type,
+            "message": self.message,
+            "severity": self.severity,
+            "traceback": self.traceback,
+        }
+
 
 ErrorCallback = Callable[[WorkflowError], None]
 

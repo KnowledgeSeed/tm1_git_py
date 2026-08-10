@@ -30,6 +30,20 @@ def test_workflow_error_is_immutable_and_pickle_safe():
         error.message = "changed"  # type: ignore[misc]
 
 
+def test_workflow_error_to_dict_has_stable_json_safe_fields():
+    error = _error()
+
+    assert error.to_dict() == {
+        "workflow": "export",
+        "phase": "dimensions",
+        "subject": "dimensions/Products.json",
+        "exception_type": "ValueError",
+        "message": "Invalid dimension",
+        "severity": "recoverable",
+        "traceback": None,
+    }
+
+
 def test_workflow_error_requires_known_severity():
     with pytest.raises(ValueError, match="severity"):
         WorkflowError(
