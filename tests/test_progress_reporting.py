@@ -1,3 +1,5 @@
+"""Unit coverage for progress-only sinks and their DEBUG logging boundary."""
+
 import logging
 import os
 
@@ -55,7 +57,7 @@ def test_composite_and_logging_progress_sink_emit():
 
     class CaptureHandler(logging.Handler):
         def emit(self, record):
-            records.append(record.getMessage())
+            records.append(record)
 
     logger = logging.getLogger("tm1_git_py.tests.progress")
     logger.setLevel(logging.DEBUG)
@@ -83,7 +85,8 @@ def test_composite_and_logging_progress_sink_emit():
     composite.close()
 
     assert callback_events == [event]
-    assert any("progress | start WORKER" in message for message in records)
+    assert any("progress | start WORKER" in record.getMessage() for record in records)
+    assert all(record.levelno == logging.DEBUG for record in records)
 
     logger.removeHandler(capture)
 
@@ -114,7 +117,7 @@ def test_logging_progress_sink_includes_worker_id():
 
     class CaptureHandler(logging.Handler):
         def emit(self, record):
-            records.append(record.getMessage())
+            records.append(record)
 
     logger = logging.getLogger("tm1_git_py.tests.progress.worker_id")
     logger.setLevel(logging.DEBUG)
@@ -132,7 +135,8 @@ def test_logging_progress_sink_includes_worker_id():
             worker_id="wid-7",
         )
     )
-    assert any("worker_id=wid-7" in message for message in records)
+    assert any("worker_id=wid-7" in record.getMessage() for record in records)
+    assert all(record.levelno == logging.DEBUG for record in records)
     logger.removeHandler(capture)
 
 
@@ -233,5 +237,4 @@ def test_generic_tqdm_sink_releases_worker_mapping_on_final_event(monkeypatch):
         assert "A" in sink.worker_bar_dict
     finally:
         sink.close()
-
 

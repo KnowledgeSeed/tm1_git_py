@@ -92,6 +92,7 @@ def test_collect_deserialize_future_converts_pool_failure_to_fatal_error(tmp_pat
         (["--log-level", "info"], "INFO"),
         (["--log-level", "debug"], "DEBUG"),
         (["--debug"], "DEBUG"),
+        (["--debug", "--log-level", "debug"], "DEBUG"),
     ],
 )
 def test_main_normalizes_log_level_and_legacy_debug_alias(
@@ -262,3 +263,147 @@ def test_compare_diagnostics_prevent_changeset_export(monkeypatch, tmp_path):
 
     assert main_module._cmd_compare(args) == 1
     changeset.export.assert_not_called()
+
+
+def test_compare_without_diagnostics_exports_and_closes_changeset(monkeypatch, tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    output_path = tmp_path / "changeset.json"
+    changeset = mock.Mock(changes=[])
+    tqdm_sink = mock.Mock()
+
+    class CompletedFuture:
+        def result(self):
+            return Model(cubes=[], dimensions=[], processes=[], chores=[]), []
+
+    class FakePool:
+        def __init__(self, **_kwargs):
+            self.futures = iter([CompletedFuture(), CompletedFuture()])
+
+        def submit(self, *_args):
+            return next(self.futures)
+
+    class FakeProgressManager:
+        def __init__(self, sink):
+            self.sink = sink
+
+        def start(self):
+            return None
+
+        def get_multi_process_progress_queue_sink(self):
+            return self.sink
+
+        def close(self):
+            return None
+
+    class FakeComparator:
+        def compare(self, *_args, **_kwargs):
+            return changeset, []
+
+    monkeypatch.setattr(main_module, "TqdmProgressSink", mock.Mock(return_value=tqdm_sink))
+    monkeypatch.setattr(main_module, "MultiProcessProgressManager", FakeProgressManager)
+    monkeypatch.setattr(main_module, "ProcessPoolExecutor", FakePool)
+    monkeypatch.setattr(main_module, "process_pool_executor_kwargs", lambda **_kwargs: {})
+    monkeypatch.setattr(main_module, "dispose_process_pool", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main_module, "Comparator", FakeComparator)
+    args = types.SimpleNamespace(
+        source=str(source),
+        target=str(target),
+        max_workers=1,
+        debug=False,
+        log_level="info",
+        log_file=None,
+        filter_rules=None,
+        mode="full",
+        output=str(output_path),
+        format="json",
+    )
+
+    assert main_module._cmd_compare(args) == 0
+    changeset.export.assert_called_once_with(
+        output_path.resolve(),
+        format="json",
+        progress_sink=tqdm_sink,
+    )
+    changeset.close.assert_called_once()
+    tqdm_sink.close.assert_called_once()
+
+
+def test_compare_process_future_failure_skips_compare_and_closes_resources(monkeypatch, tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    tqdm_sink = mock.Mock()
+    progress_managers = []
+
+    class FailedFuture:
+        def result(self):
+            raise RuntimeError("source worker exited")
+
+    class CompletedFuture:
+        def result(self):
+            return Model(cubes=[], dimensions=[], processes=[], chores=[]), []
+
+    class FakePool:
+        def __init__(self, **_kwargs):
+            self.futures = iter([FailedFuture(), CompletedFuture()])
+
+        def submit(self, *_args):
+            return next(self.futures)
+
+    class FakeProgressManager:
+        def __init__(self, sink):
+            self.sink = sink
+            self.closed = False
+            progress_managers.append(self)
+
+        def start(self):
+            return None
+
+        def get_multi_process_progress_queue_sink(self):
+            return self.sink
+
+        def close(self):
+            self.closed = True
+
+    comparator_factory = mock.Mock()
+    dispose_pool = mock.Mock()
+    monkeypatch.setattr(main_module, "TqdmProgressSink", mock.Mock(return_value=tqdm_sink))
+    monkeypatch.setattr(main_module, "MultiProcessProgressManager", FakeProgressManager)
+    monkeypatch.setattr(main_module, "ProcessPoolExecutor", FakePool)
+    monkeypatch.setattr(main_module, "process_pool_executor_kwargs", lambda **_kwargs: {})
+    monkeypatch.setattr(main_module, "dispose_process_pool", dispose_pool)
+    monkeypatch.setattr(main_module, "Comparator", comparator_factory)
+    args = types.SimpleNamespace(
+        source=str(source),
+        target=str(target),
+        max_workers=1,
+        debug=False,
+        log_level="info",
+        log_file=None,
+        filter_rules=None,
+        mode="full",
+        output=str(tmp_path / "changeset.json"),
+        format="json",
+    )
+
+    assert main_module._cmd_compare(args) == 1
+    comparator_factory.assert_not_called()
+    dispose_pool.assert_called_once()
+    assert progress_managers[0].closed is True
+    tqdm_sink.close.assert_called_once()
+
+
+def test_main_returns_130_when_command_is_interrupted(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["tm1gitpy", "export", "--server", "server"])
+    monkeypatch.setattr(main_module, "setup_logging", lambda *_args, **_kwargs: None)
+
+    def interrupt(_args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main_module, "_cmd_export", interrupt)
+
+    assert main_module.main() == 130

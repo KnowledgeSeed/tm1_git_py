@@ -88,6 +88,34 @@ class TestComparator:
         assert len(errors) == 1
         assert "Error callback failed while reporting compare/object_comparison" in caplog.text
 
+    def test_compare_emits_lifecycle_milestones_at_info_without_worker_debug_logs(self, caplog):
+        import logging
+        import tm1_git_py.services.comparator as comparator_module
+
+        with caplog.at_level(logging.DEBUG, logger=comparator_module.__name__):
+            changeset, errors = Comparator().compare(
+                Model(cubes=[], dimensions=[], processes=[], chores=[]),
+                Model(cubes=[], dimensions=[], processes=[], chores=[]),
+            )
+
+        assert len(changeset.changes) == 0
+        assert errors == []
+        comparator_records = [
+            record
+            for record in caplog.records
+            if record.name == comparator_module.__name__
+        ]
+        lifecycle_records = [
+            record
+            for record in comparator_records
+            if record.getMessage().startswith(("Starting model compare", "Completed model compare"))
+        ]
+        assert [record.levelno for record in lifecycle_records] == [
+            logging.INFO,
+            logging.INFO,
+        ]
+        assert not [record for record in comparator_records if record.levelno == logging.DEBUG]
+
     def test_compare_continues_after_a_top_level_phase_failure(self, monkeypatch):
         comparator = Comparator()
         original_compare = comparator._compare_with_children
@@ -127,14 +155,16 @@ class TestComparator:
             Model(cubes=[broken_old, good_old], dimensions=[], processes=[], chores=[], total_object_count=2),
             Model(cubes=[broken_new, good_new], dimensions=[], processes=[], chores=[], total_object_count=2),
         )
-
-        assert any(
-            change.object_type == ObjectType.MDX_VIEW and change.body.name == "AddedView"
-            for change in changeset.changes
-        )
-        assert [(error.phase, error.subject, error.severity) for error in errors] == [
-            ("child_relation", "Cubes('Broken')", "recoverable"),
-        ]
+        try:
+            assert any(
+                change.object_type == ObjectType.MDX_VIEW and change.body.name == "AddedView"
+                for change in changeset.changes
+            )
+            assert [(error.phase, error.subject, error.severity) for error in errors] == [
+                ("child_relation", "Cubes('Broken')", "recoverable"),
+            ]
+        finally:
+            changeset.close()
 
 
     def test_objects_equal(self, objects_equal_data):

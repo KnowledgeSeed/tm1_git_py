@@ -282,6 +282,50 @@ class TestSerializer:
         assert all(error.severity == "recoverable" for error in errors)
         assert (cubes_dir / "Working.json").is_file()
 
+    def test_serialize_model_closes_process_pool_after_executor_io_failure(
+        self, tmp_path, monkeypatch
+    ):
+        from concurrent.futures import Future
+        import tm1_git_py.services.serializer as serializer_module
+
+        pools = []
+
+        class EagerProcessPool:
+            def __init__(self, **_kwargs):
+                self.shutdown_calls = []
+                pools.append(self)
+
+            def submit(self, fn, *args):
+                future = Future()
+                try:
+                    future.set_result(fn(*args))
+                except Exception as exc:
+                    future.set_exception(exc)
+                return future
+
+            def shutdown(self, *, wait, cancel_futures):
+                self.shutdown_calls.append((wait, cancel_futures))
+
+        def fail_cube(*_args, **_kwargs):
+            raise OSError("cube output is unavailable")
+
+        monkeypatch.setattr(serializer_module, "ProcessPoolExecutor", EagerProcessPool)
+        monkeypatch.setattr(serializer_module, "_serialize_cube", fail_cube)
+        model = Model(
+            cubes=[Cube(name="Broken", dimensions=[], rules=[], views=[])],
+            dimensions=[],
+            processes=[],
+            chores=[],
+        )
+
+        errors = serialize_model(model, str(tmp_path), max_workers=2)
+
+        assert [(error.phase, error.subject, error.severity) for error in errors] == [
+            ("cube", str(tmp_path / "cubes" / "Broken.json"), "recoverable"),
+        ]
+        assert len(pools) == 1
+        assert pools[0].shutdown_calls == [(True, False)]
+
     def test_serialize_model_logs_diagnostics_once_and_at_info_summary(self, tmp_path, monkeypatch, caplog):
         import logging
         import tm1_git_py.services.serializer as serializer_module

@@ -160,6 +160,40 @@ class TestDeserializer:
         deserialize_dimensions.assert_called_once()
         deserialize_cubes.assert_called_once()
 
+    def test_deserialize_model_returns_fatal_assembly_diagnostic_and_notifies_callback(
+        self, monkeypatch, tmp_path
+    ):
+        original_model = deserializer_module.Model
+        model_construction_calls = 0
+
+        monkeypatch.setattr(deserializer_module, "deserialize_processes", lambda *_a, **_k: ({}, []))
+        monkeypatch.setattr(deserializer_module, "deserialize_chores", lambda *_a, **_k: ({}, []))
+        monkeypatch.setattr(deserializer_module, "deserialize_dimensions", lambda *_a, **_k: ({}, []))
+        monkeypatch.setattr(deserializer_module, "deserialize_cubes", lambda *_a, **_k: ({}, []))
+
+        def fail_first_model_construction(*args, **kwargs):
+            nonlocal model_construction_calls
+            model_construction_calls += 1
+            if model_construction_calls == 1:
+                raise RuntimeError("model store unavailable")
+            return original_model(*args, **kwargs)
+
+        monkeypatch.setattr(deserializer_module, "Model", fail_first_model_construction)
+        reported = []
+
+        model, errors = deserializer_module.deserialize_model(
+            str(tmp_path),
+            max_workers=2,
+            error_callback=reported.append,
+        )
+
+        assert isinstance(model, original_model)
+        assert model.total_object_count == 0
+        assert [(error.phase, error.subject, error.severity) for error in errors] == [
+            ("model_assembly", str(tmp_path), "fatal"),
+        ]
+        assert reported == errors
+
     def test_deserialize_model_preserves_interrupt_and_closes_progress_manager(
         self, monkeypatch, tmp_path
     ):

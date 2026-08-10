@@ -1,3 +1,6 @@
+"""Unit coverage for the pickle-safe workflow diagnostic boundary."""
+
+from dataclasses import fields
 import pickle
 
 import pytest
@@ -89,6 +92,42 @@ def test_workflow_error_from_exception_includes_traceback_only_when_requested():
 
     assert error.traceback is not None
     assert "ValueError: Invalid dimension" in error.traceback
+
+
+def test_workflow_error_drops_unpickleable_exception_and_callback_state():
+    class UnpickleableError(Exception):
+        def __init__(self) -> None:
+            self.callback = lambda: None
+            super().__init__("worker failure")
+
+    try:
+        raise UnpickleableError()
+    except UnpickleableError as exception:
+        error = workflow_error_from_exception(
+            workflow="deserialize",
+            phase="hierarchy_future",
+            subject="dimensions/Products.json",
+            exception=exception,
+            severity="fatal",
+            include_traceback=True,
+        )
+
+    assert pickle.loads(pickle.dumps(error)) == error
+    assert {field.name for field in fields(WorkflowError)} == {
+        "workflow",
+        "phase",
+        "subject",
+        "exception_type",
+        "message",
+        "severity",
+        "traceback",
+    }
+    assert all(
+        isinstance(value, (str, type(None)))
+        for value in error.to_dict().values()
+    )
+    assert not hasattr(error, "exception")
+    assert not hasattr(error, "callback")
 
 
 def test_report_error_collects_and_calls_callback_once():
