@@ -290,8 +290,7 @@ def export_check_no_errors(
         max_workers=DEFAULT_MAX_WORKERS,
     )
     assert isinstance(model, Model)
-    for category, category_errors in errors.items():
-        assert not category_errors, f"Found errors in {category}: {category_errors}"
+    assert not errors, f"Found errors: {errors}"
     return model
 
 

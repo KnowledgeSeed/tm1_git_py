@@ -23,6 +23,7 @@ from tm1_git_py.internal.process_pool import (
     process_pool_executor_kwargs,
     shutdown_process_pool_now,
 )
+from tm1_git_py.internal.worker_config import resolve_worker_counts
 from tm1_git_py.model import Model
 from tm1_git_py.model.tm1_project_json import Tm1ProjectJson
 from tm1_git_py.reporting.progress_reporting import (
@@ -450,7 +451,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
     model_id = model_output_path.name.strip()
     if not model_id:
         raise ValueError("model_id must not be empty")
-    requested_max_workers = _normalize_max_workers(args.max_workers)
+    requested_max_workers = resolve_worker_counts(args.max_workers).max_workers
 
     tqdm_sink, main_sink = _create_cli_progress_sink(
         args,
@@ -570,7 +571,7 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     tqdm_sink: TqdmProgressSink | None = None
     diagnostic_collector = _CliDiagnosticCollector()
     try:
-        requested_max_workers = _normalize_max_workers(args.max_workers)
+        requested_max_workers = resolve_worker_counts(args.max_workers).max_workers
         
         tqdm_sink, queuing_progress_sink = _create_cli_progress_sink(
             args,
